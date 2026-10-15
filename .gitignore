@@ -1,0 +1,31 @@
+# Dependencies & build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Secrets / local config
+env.json
+.env
+.env.*
+
+# WhatsApp session keys (treat like a password)
+auth_info_baileys/
+
+# Local data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
