@@ -2,335 +2,238 @@ import {
   ConflictException,
   Injectable,
   Logger,
-  NotFoundException,
+  OnApplicationBootstrap,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  Browsers,
-  fetchLatestBaileysVersion,
-  jidNormalizedUser,
-  makeWASocket,
-  useMultiFileAuthState,
-  type WAMessage,
-  type WASocket,
-} from '@whiskeysockets/baileys';
-import { rm } from 'node:fs/promises';
-import { resolve } from 'node:path';
 import pino from 'pino';
-import QRCode from 'qrcode';
-import qrcodeTerminal from 'qrcode-terminal';
+import { AuthUser } from '../auth/auth.types.js';
 import { AppConfig } from '../config/env.schema.js';
+import { DatabaseService } from '../database/database.service.js';
 import { MessagesRepository } from '../messages/messages.repository.js';
+import { SessionRecord, SessionsRepository } from '../sessions/sessions.repository.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
-import { extractGroupMessage } from './message-extractor.js';
-import { ConnectionState, GroupInfo, WhatsappStatus } from './whatsapp.types.js';
+import { RuntimeDeps, SessionRuntime } from './session-runtime.js';
+import { ConnectResult, GroupInfo, SessionStatus } from './whatsapp.types.js';
 
-const LOGGED_OUT = 401;
+/** How long `connect` waits for a QR / connection before answering with the current state. */
+const CONNECT_WAIT_MS = 15_000;
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Manages every linked WhatsApp device. Each device is a `SessionRuntime`; this class owns the
+ * runtimes, enforces ownership, restores sessions on boot and keeps `last_seen_at` fresh.
+ */
 @Injectable()
-export class WhatsappService implements OnModuleInit, OnModuleDestroy {
+export class WhatsappService implements OnModuleInit, OnApplicationBootstrap, OnModuleDestroy {
   private readonly logger = new Logger(WhatsappService.name);
-  private readonly baileysLogger: pino.Logger;
-
-  private sock: WASocket | null = null;
-  private state: ConnectionState = 'disconnected';
-  private qr: string | null = null;
-  private botJid: string | null = null;
-  private botLid: string | null = null;
-  private reconnectAttempts = 0;
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private nextReconnectAt: number | null = null;
-  private lastDisconnectCode: number | null = null;
-  /** True when the user asked to stop; prevents automatic reconnects. */
-  private manualStop = false;
-  /** Serializes socket creation so two sockets never run for the same session. */
-  private starting: Promise<void> | null = null;
+  private readonly runtimes = new Map<string, SessionRuntime>();
+  private readonly deps: RuntimeDeps;
+  private heartbeat: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
 
   constructor(
     private readonly config: ConfigService<AppConfig, true>,
+    private readonly database: DatabaseService,
+    private readonly sessions: SessionsRepository,
     private readonly messages: MessagesRepository,
   ) {
-    this.baileysLogger = pino({ level: this.config.get('app', { infer: true }).logLevel });
-  }
-
-  async onModuleInit(): Promise<void> {
-    if (this.cfg.autoConnectOnBoot) {
-      this.logger.log('autoConnectOnBoot is enabled, connecting...');
-      await this.connect();
-    }
-  }
-
-  async onModuleDestroy(): Promise<void> {
-    this.manualStop = true;
-    this.teardownSocket();
+    const wa = this.cfg;
+    this.deps = {
+      database,
+      sessions,
+      messages,
+      baileysLogger: pino({ level: this.config.get('app', { infer: true }).logLevel }),
+      reconnect: wa.reconnect,
+      printQrInTerminal: wa.printQrInTerminal,
+    };
   }
 
   private get cfg() {
     return this.config.get('whatsapp', { infer: true });
   }
 
+  // ---------------------------------------------------------------- lifecycle
+
+  onModuleInit(): void {
+    this.heartbeat = setInterval(() => this.beat(), this.cfg.heartbeatIntervalMs);
+    this.heartbeat.unref();
+  }
+
+  /** Runs after every module (including the database) is initialised. */
+  onApplicationBootstrap(): void {
+    const stale = this.sessions.resetStaleStatuses();
+    if (stale) this.logger.log(`Reset ${stale} stale session status(es) left over from the last run`);
+
+    if (!this.cfg.restoreOnBoot) {
+      this.logger.log('restoreOnBoot is disabled; sessions stay stopped until connected via the API');
+      return;
+    }
+    // Not awaited: the HTTP server should come up while sessions reconnect in the background.
+    void this.restoreSessions().catch((e: Error) => this.logger.error(`Session restore failed: ${e.message}`));
+  }
+
+  onModuleDestroy(): void {
+    this.shuttingDown = true;
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.beat();
+    // desired_state is deliberately untouched, so these sessions come back on the next boot.
+    for (const runtime of this.runtimes.values()) runtime.shutdown();
+  }
+
+  /** Re-opens every paired session that was meant to be connected, one at a time. */
+  private async restoreSessions(): Promise<void> {
+    const toRestore = this.sessions.listToRestore();
+    if (!toRestore.length) return;
+    this.logger.log(`Restoring ${toRestore.length} session(s) from the database`);
+
+    for (const rec of toRestore) {
+      if (this.shuttingDown) return;
+      try {
+        await this.runtimeFor(rec).connect();
+      } catch (e) {
+        this.logger.error(`Could not restore session ${rec.id}: ${(e as Error).message}`);
+      }
+      await sleep(this.cfg.restoreStaggerMs);
+    }
+  }
+
+  /** Records that connected sessions are still alive. */
+  private beat(): void {
+    const alive = [...this.runtimes.values()].filter((r) => r.isConnected()).map((r) => r.id);
+    this.sessions.touch(alive, Date.now());
+  }
+
   // ---------------------------------------------------------------- public API
 
-  async connect(): Promise<WhatsappStatus> {
-    if (this.sock || this.starting) {
-      return this.status(); // already connecting / connected: idempotent
+  create(user: AuthUser, label: string | null): SessionStatus {
+    const max = this.cfg.maxSessionsPerUser;
+    if (this.sessions.countByOwner(user.id) >= max) {
+      throw new ConflictException(`Session limit reached (${max} per user)`);
     }
-    this.manualStop = false;
-    this.reconnectAttempts = 0;
+    return this.toStatus(this.sessions.create(user.id, label));
+  }
+
+  list(user: AuthUser): SessionStatus[] {
+    return this.sessions.listFor(user).map((rec) => this.toStatus(rec));
+  }
+
+  status(user: AuthUser, id: string): SessionStatus {
+    return this.toStatus(this.sessions.requireAccessible(id, user));
+  }
+
+  /**
+   * Starts the session and marks it to be restored on boot. Waits (up to `CONNECT_WAIT_MS`) until
+   * the session either shows a QR or connects, so a never-paired session returns its QR directly.
+   */
+  async connect(user: AuthUser, id: string): Promise<ConnectResult> {
+    const rec = this.sessions.requireAccessible(id, user);
+    this.sessions.update(id, { desiredState: 'connected' });
+    const runtime = this.runtimeFor(rec);
+    await runtime.connect();
+    await runtime.waitUntilSettled(CONNECT_WAIT_MS);
+
+    const status = this.status(user, id);
+    if (!status.hasQr) return { ...status, qr: null, qrDataUrl: null };
     try {
-      await this.startSocket();
-    } catch (e) {
-      this.state = 'disconnected';
-      throw e;
+      const { qr, dataUrl } = await runtime.getQr();
+      return { ...status, qr, qrDataUrl: dataUrl };
+    } catch {
+      return { ...status, qr: null, qrDataUrl: null }; // QR vanished (e.g. just connected)
     }
-    return this.status();
   }
 
-  /** Closes the socket but keeps the session credentials on disk. */
-  disconnect(): WhatsappStatus {
-    this.manualStop = true;
-    this.teardownSocket();
-    this.logger.log('Disconnected (credentials kept)');
-    return this.status();
+  /** Closes the socket, keeps credentials, and stops the session from being restored on boot. */
+  disconnect(user: AuthUser, id: string): SessionStatus {
+    const rec = this.sessions.requireAccessible(id, user);
+    this.sessions.update(id, { desiredState: 'stopped' });
+    this.runtimes.get(rec.id)?.disconnect();
+    return this.status(user, id);
   }
 
-  /** Logs the linked device out and wipes the stored session; the next connect needs a new QR. */
-  async logout(): Promise<WhatsappStatus> {
-    this.manualStop = true;
-    const sock = this.sock;
-    if (sock && this.state === 'connected') {
-      try {
-        await sock.logout();
-      } catch (e) {
-        this.logger.warn(`logout() failed, wiping local session anyway: ${(e as Error).message}`);
-      }
+  /** Unlinks the device and wipes its credentials; the next connect needs a new QR. */
+  async logout(user: AuthUser, id: string): Promise<SessionStatus> {
+    const rec = this.sessions.requireAccessible(id, user);
+    this.sessions.update(id, { desiredState: 'stopped' });
+    await this.runtimeFor(rec).logout();
+    return this.status(user, id);
+  }
+
+  /** Logs the device out (best effort) and deletes the session with its credentials and messages. */
+  async remove(user: AuthUser, id: string): Promise<{ deleted: true }> {
+    const rec = this.sessions.requireAccessible(id, user);
+    const runtime = this.runtimes.get(rec.id);
+    if (runtime) {
+      await runtime.logout();
+      this.runtimes.delete(rec.id);
     }
-    this.teardownSocket();
-    await rm(resolve(this.cfg.authDir), { recursive: true, force: true });
-    this.logger.log('Logged out and session wiped');
-    return this.status();
+    this.database.connection.transaction(() => {
+      this.messages.deleteBySession(rec.id);
+      this.sessions.delete(rec.id); // cascades to auth_creds
+    })();
+    this.logger.log(`Deleted session ${rec.id}`);
+    return { deleted: true };
   }
 
-  status(): WhatsappStatus {
-    return {
-      state: this.state,
-      botJid: this.botJid,
-      botLid: this.botLid,
-      botName: this.cfg.botName,
-      reconnectAttempts: this.reconnectAttempts,
-      nextReconnectAt: this.nextReconnectAt,
-      hasQr: this.qr !== null,
-      lastDisconnectCode: this.lastDisconnectCode,
-    };
+  getQr(user: AuthUser, id: string) {
+    const rec = this.sessions.requireAccessible(id, user);
+    return this.runtimeFor(rec).getQr();
   }
 
-  async getQr(): Promise<{ qr: string; dataUrl: string }> {
-    if (!this.qr) {
-      throw new NotFoundException('No QR code available (not in qr_pending state)');
-    }
-    const dataUrl = await QRCode.toDataURL(this.qr, { margin: 2, width: 320 });
-    return { qr: this.qr, dataUrl };
+  listGroups(user: AuthUser, id: string): Promise<GroupInfo[]> {
+    return this.connectedRuntime(user, id).listGroups();
   }
 
-  async listGroups(): Promise<GroupInfo[]> {
-    const sock = this.requireSocket();
-    const groups = await sock.groupFetchAllParticipating();
-    return Object.values(groups).map((g) => ({
-      id: g.id,
-      subject: g.subject,
-      participants: g.participants.length,
-      creation: g.creation ?? null,
-    }));
-  }
-
-  async sendMessage(dto: SendMessageDto): Promise<{ id: string | null; jid: string }> {
-    const sock = this.requireSocket();
-
-    let quoted: WAMessage | undefined;
-    if (dto.quotedMessageId) {
-      const stored = this.messages.findById(dto.jid, dto.quotedMessageId);
-      if (!stored) {
-        throw new NotFoundException(`Quoted message ${dto.quotedMessageId} not found in ${dto.jid}`);
-      }
-      quoted = {
-        key: {
-          remoteJid: dto.jid,
-          id: stored.id,
-          fromMe: stored.isBot,
-          participant: stored.isBot ? undefined : stored.senderId,
-        },
-        message: { conversation: stored.text },
-      };
-    }
-
-    const sent = await sock.sendMessage(dto.jid, { text: dto.text }, quoted ? { quoted } : undefined);
-    if (sent) this.ingest(sent);
-    return { id: sent?.key?.id ?? null, jid: dto.jid };
+  sendMessage(user: AuthUser, id: string, dto: SendMessageDto) {
+    return this.connectedRuntime(user, id).sendMessage(dto);
   }
 
   // ------------------------------------------------------------------ internals
 
-  private requireSocket(): WASocket {
-    if (!this.sock || this.state !== 'connected') {
-      throw new ConflictException(`WhatsApp is not connected (state: ${this.state})`);
+  private connectedRuntime(user: AuthUser, id: string): SessionRuntime {
+    const rec = this.sessions.requireAccessible(id, user);
+    const runtime = this.runtimes.get(rec.id);
+    if (!runtime?.isConnected()) {
+      throw new ConflictException(`Session is not connected (state: ${runtime?.snapshot().state ?? rec.status})`);
     }
-    return this.sock;
+    return runtime;
   }
 
-  private startSocket(): Promise<void> {
-    if (this.starting) return this.starting;
-    this.starting = this.doStartSocket().finally(() => {
-      this.starting = null;
-    });
-    return this.starting;
+  /** The one place runtimes are created, so there is never more than one per session. */
+  private runtimeFor(rec: SessionRecord): SessionRuntime {
+    let runtime = this.runtimes.get(rec.id);
+    if (!runtime) {
+      runtime = new SessionRuntime(
+        rec.id,
+        { state: rec.status, jid: rec.jid, lid: rec.lid },
+        this.deps,
+      );
+      this.runtimes.set(rec.id, runtime);
+    }
+    return runtime;
   }
 
-  private async doStartSocket(): Promise<void> {
-    this.clearReconnectTimer();
-    this.state = 'connecting';
-    this.qr = null;
-
-    const { state, saveCreds } = await useMultiFileAuthState(resolve(this.cfg.authDir));
-
-    let version: [number, number, number] | undefined;
-    try {
-      version = (await fetchLatestBaileysVersion()).version;
-    } catch (e) {
-      this.logger.warn(`Could not fetch latest WA version, using library default: ${(e as Error).message}`);
-    }
-
-    // A disconnect() may have been requested while we were loading.
-    if (this.manualStop) {
-      this.state = 'disconnected';
-      return;
-    }
-
-    const sock = makeWASocket({
-      auth: state,
-      version,
-      logger: this.baileysLogger,
-      browser: Browsers.ubuntu('Chrome'),
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-    });
-    this.sock = sock;
-
-    // Events from a socket we've already replaced or torn down are ignored.
-    const isCurrent = () => this.sock === sock;
-
-    sock.ev.on('creds.update', () => {
-      if (isCurrent()) void saveCreds();
-    });
-
-    sock.ev.on('connection.update', (update) => {
-      if (!isCurrent()) return;
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        this.qr = qr;
-        this.state = 'qr_pending';
-        this.logger.log('QR code ready: scan it in WhatsApp > Linked devices (or GET /api/whatsapp/qr)');
-        if (this.cfg.printQrInTerminal) qrcodeTerminal.generate(qr, { small: true });
-      }
-
-      if (connection === 'open') {
-        this.state = 'connected';
-        this.qr = null;
-        this.reconnectAttempts = 0;
-        this.nextReconnectAt = null;
-        this.lastDisconnectCode = null;
-        this.botJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
-        this.botLid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : null;
-        this.logger.log(`Connected as ${this.botJid}`);
-      }
-
-      if (connection === 'close') {
-        const code = (lastDisconnect?.error as any)?.output?.statusCode as number | undefined;
-        this.handleClose(code ?? null, lastDisconnect?.error?.message);
-      }
-    });
-
-    sock.ev.on('messages.upsert', ({ messages }) => {
-      if (!isCurrent()) return;
-      for (const m of messages) this.ingest(m);
-    });
-  }
-
-  private ingest(msg: WAMessage): void {
-    try {
-      const stored = extractGroupMessage(msg, this.botJid);
-      if (stored) this.messages.insert(stored);
-    } catch (e) {
-      this.logger.error(`Failed to ingest message: ${(e as Error).message}`);
-    }
-  }
-
-  private handleClose(code: number | null, reason?: string): void {
-    this.sock = null;
-    this.qr = null;
-    this.lastDisconnectCode = code;
-    this.logger.warn(`Connection closed (code ${code ?? 'n/a'}${reason ? `: ${reason}` : ''})`);
-
-    if (this.manualStop) {
-      this.state = 'disconnected';
-      return;
-    }
-
-    if (code === LOGGED_OUT) {
-      // Session was revoked from the phone: credentials are useless, require a fresh QR.
-      this.state = 'disconnected';
-      this.botJid = this.botLid = null;
-      this.logger.warn('Logged out from the phone. Wiping session; call POST /connect to link again.');
-      void rm(resolve(this.cfg.authDir), { recursive: true, force: true });
-      return;
-    }
-
-    this.scheduleReconnect();
-  }
-
-  /** Exponential backoff with jitter. Never throws and never kills the process (NFR-4). */
-  private scheduleReconnect(): void {
-    const { baseDelayMs, maxDelayMs } = this.cfg.reconnect;
-    const exp = Math.min(maxDelayMs, baseDelayMs * 2 ** this.reconnectAttempts);
-    const delay = Math.round(exp / 2 + Math.random() * (exp / 2));
-    this.reconnectAttempts += 1;
-    this.state = 'connecting';
-    this.nextReconnectAt = Date.now() + delay;
-    this.logger.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
-    this.clearReconnectTimer();
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.nextReconnectAt = null;
-      if (this.manualStop) return;
-      this.startSocket().catch((e: Error) => {
-        this.logger.error(`Reconnect failed: ${e.message}`);
-        if (!this.manualStop) this.scheduleReconnect();
-      });
-    }, delay);
-  }
-
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
-    this.nextReconnectAt = null;
-  }
-
-  private teardownSocket(): void {
-    this.clearReconnectTimer();
-    const sock = this.sock;
-    this.sock = null; // makes in-flight event handlers ignore this socket
-    this.qr = null;
-    this.state = 'disconnected';
-    this.nextReconnectAt = null;
-    if (sock) {
-      try {
-        sock.end(undefined);
-      } catch (e) {
-        this.logger.debug(`Error while closing socket: ${(e as Error).message}`);
-      }
-    }
+  /** Merges the persisted row with the live runtime (if any). */
+  private toStatus(rec: SessionRecord): SessionStatus {
+    const fresh = this.sessions.findById(rec.id) ?? rec;
+    const live = this.runtimes.get(rec.id)?.snapshot();
+    return {
+      id: fresh.id,
+      ownerId: fresh.ownerId,
+      label: fresh.label,
+      state: live?.state ?? fresh.status,
+      desiredState: fresh.desiredState,
+      botJid: live?.botJid ?? fresh.jid,
+      botLid: live?.botLid ?? fresh.lid,
+      reconnectAttempts: live?.reconnectAttempts ?? 0,
+      nextReconnectAt: live?.nextReconnectAt ?? null,
+      hasQr: live?.hasQr ?? false,
+      lastDisconnectCode: fresh.lastDisconnectCode,
+      lastConnectedAt: fresh.lastConnectedAt,
+      lastSeenAt: fresh.lastSeenAt,
+      createdAt: fresh.createdAt,
+    };
   }
 }

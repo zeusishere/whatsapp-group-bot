@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { AppConfig, DEFAULT_CONFIG, LOG_LEVELS, LogLevel } from './env.schema.js';
+import { AppConfig, DEFAULT_CONFIG, LOG_LEVELS, LogLevel, MIN_JWT_SECRET_LENGTH } from './env.schema.js';
 
 type Obj = Record<string, unknown>;
 
@@ -58,6 +58,8 @@ export function validateConfig(raw: unknown): AppConfig {
     errors.push('"whatsapp.reconnect" must be an object');
   }
   const db = section('database');
+  const au = section('auth');
+  const isNonNegInt = (v: unknown) => Number.isInteger(v) && (v as number) >= 0;
 
   const config: AppConfig = {
     app: {
@@ -72,15 +74,14 @@ export function validateConfig(raw: unknown): AppConfig {
       ),
     },
     whatsapp: {
-      authDir: pick(wa, 'whatsapp', 'authDir', d.whatsapp.authDir, isStr, 'a non-empty string'),
-      botName: pick(wa, 'whatsapp', 'botName', d.whatsapp.botName, isStr, 'a non-empty string'),
-      autoConnectOnBoot: pick(
+      restoreOnBoot: pick(wa, 'whatsapp', 'restoreOnBoot', d.whatsapp.restoreOnBoot, isBool, 'a boolean'),
+      restoreStaggerMs: pick(
         wa,
         'whatsapp',
-        'autoConnectOnBoot',
-        d.whatsapp.autoConnectOnBoot,
-        isBool,
-        'a boolean',
+        'restoreStaggerMs',
+        d.whatsapp.restoreStaggerMs,
+        isNonNegInt,
+        'a non-negative integer',
       ),
       printQrInTerminal: pick(
         wa,
@@ -89,6 +90,22 @@ export function validateConfig(raw: unknown): AppConfig {
         d.whatsapp.printQrInTerminal,
         isBool,
         'a boolean',
+      ),
+      maxSessionsPerUser: pick(
+        wa,
+        'whatsapp',
+        'maxSessionsPerUser',
+        d.whatsapp.maxSessionsPerUser,
+        isPosInt,
+        'a positive integer',
+      ),
+      heartbeatIntervalMs: pick(
+        wa,
+        'whatsapp',
+        'heartbeatIntervalMs',
+        d.whatsapp.heartbeatIntervalMs,
+        isPosInt,
+        'a positive integer',
       ),
       reconnect: {
         baseDelayMs: pick(
@@ -120,8 +137,39 @@ export function validateConfig(raw: unknown): AppConfig {
         'a positive integer',
       ),
     },
-    apiKey: pick(raw, '(root)', 'apiKey', d.apiKey, isStr, 'a non-empty string'),
+    auth: {
+      jwtSecret: pick(
+        au,
+        'auth',
+        'jwtSecret',
+        d.auth.jwtSecret,
+        (v) => typeof v === 'string' && v.length >= MIN_JWT_SECRET_LENGTH,
+        `a string of at least ${MIN_JWT_SECRET_LENGTH} characters`,
+      ),
+      tokenTtlSeconds: pick(
+        au,
+        'auth',
+        'tokenTtlSeconds',
+        d.auth.tokenTtlSeconds,
+        isPosInt,
+        'a positive integer (seconds)',
+      ),
+      allowRegistration: pick(
+        au,
+        'auth',
+        'allowRegistration',
+        d.auth.allowRegistration,
+        isBool,
+        'a boolean',
+      ),
+    },
   };
+
+  if (au.jwtSecret === undefined) {
+    errors.push(
+      `"auth.jwtSecret" is required (at least ${MIN_JWT_SECRET_LENGTH} characters, e.g. \`openssl rand -hex 32\`)`,
+    );
+  }
 
   if (config.whatsapp.reconnect.maxDelayMs < config.whatsapp.reconnect.baseDelayMs) {
     errors.push('"whatsapp.reconnect.maxDelayMs" must be >= "baseDelayMs"');
