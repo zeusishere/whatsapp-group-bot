@@ -59,6 +59,13 @@ export function validateConfig(raw: unknown): AppConfig {
   }
   const db = section('database');
   const au = section('auth');
+  const llm = section('llm');
+  const bot = section('bot');
+  const tr = section('tracing');
+  const isUnit = (v: unknown) => typeof v === 'number' && v >= 0 && v <= 1;
+  const isTemp = (v: unknown) => typeof v === 'number' && v >= 0 && v <= 2;
+  const isRetries = (v: unknown) => Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 5;
+  const isApiKey = (v: unknown) => typeof v === 'string';
   const isNonNegInt = (v: unknown) => Number.isInteger(v) && (v as number) >= 0;
 
   const config: AppConfig = {
@@ -162,6 +169,37 @@ export function validateConfig(raw: unknown): AppConfig {
         isBool,
         'a boolean',
       ),
+    },
+    llm: {
+      apiKey: pick(llm, 'llm', 'apiKey', d.llm.apiKey, isApiKey, 'a string (empty disables the bot)'),
+      model: pick(llm, 'llm', 'model', d.llm.model, isStr, 'a non-empty string'),
+      embeddingModel: pick(llm, 'llm', 'embeddingModel', d.llm.embeddingModel, isStr, 'a non-empty string'),
+      temperature: pick(llm, 'llm', 'temperature', d.llm.temperature, isTemp, 'a number between 0 and 2'),
+      requestTimeoutMs: pick(llm, 'llm', 'requestTimeoutMs', d.llm.requestTimeoutMs, isPosInt, 'a positive integer'),
+      maxRetries: pick(llm, 'llm', 'maxRetries', d.llm.maxRetries, isRetries, 'an integer between 0 and 5'),
+    },
+    bot: {
+      candidatePoolSize: pick(bot, 'bot', 'candidatePoolSize', d.bot.candidatePoolSize, isPosInt, 'a positive integer'),
+      retrievalTopK: pick(bot, 'bot', 'retrievalTopK', d.bot.retrievalTopK, isPosInt, 'a positive integer'),
+      minSimilarity: pick(bot, 'bot', 'minSimilarity', d.bot.minSimilarity, isUnit, 'a number between 0 and 1'),
+      minLexicalCoverage: pick(
+        bot,
+        'bot',
+        'minLexicalCoverage',
+        d.bot.minLexicalCoverage,
+        isUnit,
+        'a number between 0 and 1',
+      ),
+      contextTokenBudget: pick(bot, 'bot', 'contextTokenBudget', d.bot.contextTokenBudget, isPosInt, 'a positive integer'),
+      maxOutputTokens: pick(bot, 'bot', 'maxOutputTokens', d.bot.maxOutputTokens, isPosInt, 'a positive integer'),
+      recentHistoryTurns: pick(bot, 'bot', 'recentHistoryTurns', d.bot.recentHistoryTurns, isNonNegInt, 'a non-negative integer'),
+      maxInputChars: pick(bot, 'bot', 'maxInputChars', d.bot.maxInputChars, isPosInt, 'a positive integer'),
+      fallbackReply: pick(bot, 'bot', 'fallbackReply', d.bot.fallbackReply, isStr, 'a non-empty string'),
+    },
+    tracing: {
+      redact: pick(tr, 'tracing', 'redact', d.tracing.redact, isBool, 'a boolean'),
+      previewChars: pick(tr, 'tracing', 'previewChars', d.tracing.previewChars, isPosInt, 'a positive integer'),
+      maxFieldChars: pick(tr, 'tracing', 'maxFieldChars', d.tracing.maxFieldChars, isPosInt, 'a positive integer'),
     },
   };
 

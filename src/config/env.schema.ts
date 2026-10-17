@@ -30,6 +30,36 @@ export interface AppConfig {
     /** When false, only the very first user can self-register; admins create the rest. */
     allowRegistration: boolean;
   };
+  /** Gemini access. With no `apiKey` the conversational bot is disabled (ingestion keeps working). */
+  llm: {
+    apiKey: string;
+    model: string;
+    embeddingModel: string;
+    temperature: number;
+    requestTimeoutMs: number;
+    /** Extra attempts for transient generation errors (timeouts, 429, 5xx). */
+    maxRetries: number;
+  };
+  bot: {
+    /** Candidates fetched per query from each retriever before fusion. */
+    candidatePoolSize: number;
+    /** Max chunks that survive filtering and are considered for the prompt. */
+    retrievalTopK: number;
+    /** Minimum cosine similarity for a chunk to count as relevant. */
+    minSimilarity: number;
+    /** Minimum fraction of query keywords a chunk must contain when it has no embedding. */
+    minLexicalCoverage: number;
+    contextTokenBudget: number;
+    maxOutputTokens: number;
+    recentHistoryTurns: number;
+    maxInputChars: number;
+    fallbackReply: string;
+  };
+  tracing: {
+    redact: boolean;
+    previewChars: number;
+    maxFieldChars: number;
+  };
 }
 
 export const LOG_LEVELS: LogLevel[] = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'];
@@ -48,4 +78,25 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   database: { path: './data/bot.db', maxMessagesPerGroup: 3000 },
   auth: { jwtSecret: '', tokenTtlSeconds: 3600, allowRegistration: false },
+  llm: {
+    apiKey: '',
+    model: 'gemini-2.5-flash',
+    embeddingModel: 'gemini-embedding-001',
+    temperature: 0.2,
+    requestTimeoutMs: 30_000,
+    maxRetries: 1,
+  },
+  bot: {
+    candidatePoolSize: 30,
+    retrievalTopK: 8,
+    minSimilarity: 0.6,
+    minLexicalCoverage: 0.34,
+    contextTokenBudget: 1500,
+    maxOutputTokens: 512,
+    recentHistoryTurns: 4,
+    maxInputChars: 2000,
+    fallbackReply:
+      "I couldn't find enough relevant context in this chat to answer that reliably. Could you rephrase or add more detail?",
+  },
+  tracing: { redact: true, previewChars: 240, maxFieldChars: 4000 },
 };

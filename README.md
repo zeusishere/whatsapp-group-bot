@@ -1,10 +1,11 @@
 # WhatsApp Group Agent
 
-An autonomous WhatsApp group agent with group memory and (later) grounded web browsing.
+An autonomous WhatsApp group agent with group memory, Gemini-backed answers, and a fully auditable
+execution graph for every reply.
 
-This repository is built incrementally. **Step 1 (current)** is the foundation: a NestJS service that links a
-dedicated WhatsApp number through [Baileys](https://github.com/WhiskeySockets/Baileys), passively stores group
-messages in SQLite, and exposes a JWT-protected REST API to manage devices, inspect and send messages.
+The service links dedicated WhatsApp numbers through [Baileys](https://github.com/WhiskeySockets/Baileys),
+stores group messages in SQLite, answers mentions (and `POST /api/chat`) from retrieved context, and
+exposes a JWT-protected REST API to manage devices and inspect traces.
 
 ## Why Baileys
 
@@ -21,8 +22,8 @@ credentials are persisted in SQLite.
 - Node.js >= 20 (developed on 22), TypeScript, ESM
 - NestJS 12 (`@nestjs/common`, `core`, `config`, `swagger`)
 - `@whiskeysockets/baileys` for the WhatsApp transport
-- `better-sqlite3` in WAL mode for storage (messages, users, sessions and WhatsApp credentials)
-- `@nestjs/jwt` for authentication
+- `better-sqlite3` in WAL mode for storage (messages, users, sessions, WhatsApp credentials, traces)
+- `@google/genai` for Gemini generation and embeddings; `@nestjs/jwt` for authentication
 - pnpm
 
 ## Getting started
@@ -87,6 +88,30 @@ QR. Each session row has two fields:
 `lastSeenAt` is refreshed every `whatsapp.heartbeatIntervalMs` while a session is connected, so after a crash it shows
 roughly when the process died.
 
+### Asking the bot
+
+Set `llm.apiKey` (a Gemini key). Without it, ingestion still works and `POST /api/chat` returns 503.
+
+The bot replies when it is **@-mentioned** in a group (JID or LID), or when you call `POST /api/chat`.
+Each request is a *turn* with a ULID `turnId`. Retrieval is hybrid: SQLite FTS5 (BM25) plus stored
+Gemini embeddings, fused with reciprocal-rank fusion. If embeddings are unavailable it degrades to
+keyword search and records that in the trace.
+
+```bash
+# continue after linking a device (ID = device session, TOKEN as above)
+curl -X POST $B/chat -H "$AUTH" -H 'content-type: application/json' \
+  -H 'Idempotency-Key: demo-1' \
+  -d "{\"deviceSessionId\":\"$ID\",\"groupId\":\"1203630xxxxx@g.us\",\"message\":\"when is the launch?\"}"
+
+# inspect the execution graph (JSON) and a Mermaid flowchart
+curl $B/debug/traces/<turnId> -H "$AUTH"
+curl "$B/debug/traces/<turnId>?format=mermaid" -H "$AUTH"
+```
+
+`user_input_raw`, `bot_reply_raw` and `chat_messages.content` are stored as sent. Trace fields
+(`input_state`, `decision_outcome`, `rationale`, chunk previews) are redacted: secrets, PII patterns,
+sensitive keys, and oversized strings are masked before they are written.
+
 ## Configuration (`env.json`)
 
 `env.json` is gitignored. `env.example.json` is the committed template. Set `ENV_JSON_PATH` to load a different
@@ -108,6 +133,24 @@ file. The file is validated at startup and the app refuses to boot on invalid va
 | `auth.jwtSecret` | *required* | HS256 signing secret, at least 32 characters |
 | `auth.tokenTtlSeconds` | `3600` | Access token lifetime |
 | `auth.allowRegistration` | `false` | Allow self-registration after the first (admin) user |
+| `llm.apiKey` | `""` | Gemini API key; empty disables chat and mention replies |
+| `llm.model` | `gemini-2.5-flash` | Generation model |
+| `llm.embeddingModel` | `gemini-embedding-001` | Embedding model |
+| `llm.temperature` | `0.2` | Generation temperature (0–2) |
+| `llm.requestTimeoutMs` | `30000` | Per-call timeout |
+| `llm.maxRetries` | `1` | Extra attempts for transient generation errors |
+| `bot.candidatePoolSize` | `30` | Candidates fetched per retriever before fusion |
+| `bot.retrievalTopK` | `8` | Max chunks considered for the prompt |
+| `bot.minSimilarity` | `0.6` | Minimum cosine similarity to keep a chunk |
+| `bot.minLexicalCoverage` | `0.34` | Minimum keyword coverage when a chunk has no embedding |
+| `bot.contextTokenBudget` | `1500` | Token budget for retrieved context |
+| `bot.maxOutputTokens` | `512` | Generation cap |
+| `bot.recentHistoryTurns` | `4` | Prior thread turns given to rewrite/router |
+| `bot.maxInputChars` | `2000` | Guardrail length limit |
+| `bot.fallbackReply` | *(see example)* | Deterministic reply when retrieval is empty or weak |
+| `tracing.redact` | `true` | Mask secrets and PII in trace payloads |
+| `tracing.previewChars` | `240` | Max characters of a chunk preview |
+| `tracing.maxFieldChars` | `4000` | Truncate any trace string longer than this |
 
 ## API
 
@@ -129,11 +172,19 @@ file. The file is validated at startup and the app refuses to boot on invalid va
 | POST | `/api/sessions/:id/send` | Send text: `{ "jid", "text", "quotedMessageId?" }` |
 | GET | `/api/sessions/:id/messages` | Stored messages, newest first. Query: `groupId`, `limit` (1-500), `before` (epoch ms) |
 | GET | `/api/sessions/:id/messages/groups` | Groups with stored messages and counts |
+| POST | `/api/chat` | Run a turn. Body: `{ sessionId? }` or `{ deviceSessionId, groupId }` plus `message`. Optional `Idempotency-Key` header (202 if the turn is still running) |
+| GET | `/api/debug/traces/:turnId` | Execution DAG, timeline, retrievals, messages, Mermaid. `?format=mermaid` for `text/plain` |
+| GET | `/api/debug/messages/:messageId/trace` | Same view, looked up from a user or assistant message |
 
 ## Behavior notes
 
-- **Passive ingestion:** only group chats (`@g.us`) with text or extended text are stored. The bot never replies on
-  its own in this step.
+- **Passive ingestion:** only group chats (`@g.us`) with text or extended text are stored. The bot replies only when
+  @-mentioned (or via `POST /api/chat`).
+- **Traceability:** every turn writes `conversation_turns`, `decision_spans`, `retrieval_logs` and `chat_messages`.
+  Spans are written as they close; a crash still keeps completed steps. In-progress turns are marked `FAILED`
+  (`PROCESS_RESTART`) on the next boot. Duplicate `Idempotency-Key` values reuse the existing turn.
+- **Redaction:** credentials, emails, phones, cards and common API-key patterns are stripped from traces. Chat
+  history itself is stored raw.
 - **Reconnects:** unexpected disconnects trigger exponential backoff with jitter and never stop the process. A
   manual disconnect, or being logged out from the phone (status `logged_out`, credentials wiped), stops reconnecting.
 - **Storage:** SQLite runs in WAL mode; each group of each session is trimmed to the latest `maxMessagesPerGroup`.
@@ -154,7 +205,8 @@ src/
   database/               better-sqlite3 service (WAL, schema, migrations)
   sessions/               sessions table repository (status, desired state, ownership)
   messages/               repository + read API (scoped per session)
-  whatsapp/               session manager, per-device runtime, SQLite auth state, controller
+  whatsapp/               session manager, per-device runtime, SQLite auth state, mention hook
+  chatbot/                traced pipeline (collector, retrieval, Gemini, inspector, chat + debug APIs)
 env.example.json          config template
 ```
 
@@ -169,8 +221,7 @@ env.example.json          config template
 
 ## Roadmap
 
-1. **Foundation (this step):** project setup, Baileys connection API, message storage.
-2. Mention detection (`@BotName`, `mentionedJid`), quoted-message capture, typing presence, rate limiting.
-3. Context retrieval (sliding window, quoted lookup, token budget) and `query_logs` audit table.
-4. LLM answering pipeline with Tavily search and Jina Reader page fetch, plus plaintext citations.
-5. Offline evaluation harness.
+1. **Foundation:** project setup, Baileys connection API, multi-device sessions, JWT, message storage.
+2. **Traced bot (this step):** mention replies, hybrid retrieval, Gemini generation, turn/span/retrieval audit, debug API.
+3. Cross-encoder reranker, Tavily / Jina tools, typing presence and outbound rate limiting.
+4. Offline evaluation harness.

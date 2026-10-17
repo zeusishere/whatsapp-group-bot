@@ -11,7 +11,7 @@ import type pino from 'pino';
 import QRCode from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { DatabaseService } from '../database/database.service.js';
-import { MessagesRepository } from '../messages/messages.repository.js';
+import { MessagesRepository, StoredMessage } from '../messages/messages.repository.js';
 import { SessionPatch, SessionsRepository } from '../sessions/sessions.repository.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { extractGroupMessage } from './message-extractor.js';
@@ -27,6 +27,11 @@ export interface RuntimeDeps {
   baileysLogger: pino.Logger;
   reconnect: { baseDelayMs: number; maxDelayMs: number };
   printQrInTerminal: boolean;
+  /**
+   * Called after a newly stored inbound group message that @-mentions this device.
+   * Wired by WhatsappService; ChatService registers the actual handler. Must not throw.
+   */
+  onMention?: (deviceSessionId: string, message: StoredMessage) => void;
 }
 
 /** Volatile, in-memory facts about a running session. */
@@ -310,10 +315,26 @@ export class SessionRuntime {
   private ingest(msg: WAMessage): void {
     try {
       const stored = extractGroupMessage(msg, this.botJid);
-      if (stored) this.deps.messages.insert(this.id, stored);
+      if (!stored) return;
+      this.deps.messages.insert(this.id, stored);
+      // Bot-authored messages never trigger a turn; mentions of this device do.
+      if (!stored.isBot && this.mentionsBot(stored)) {
+        try {
+          this.deps.onMention?.(this.id, stored);
+        } catch (e) {
+          this.logger.error(`Mention handler failed: ${(e as Error).message}`);
+        }
+      }
     } catch (e) {
       this.logger.error(`Failed to ingest message: ${(e as Error).message}`);
     }
+  }
+
+  /** True when the message @-mentioned this device's JID or LID. */
+  private mentionsBot(m: StoredMessage): boolean {
+    const mine = [this.botJid, this.botLid].filter((j): j is string => !!j).map((j) => jidNormalizedUser(j));
+    if (!mine.length) return false;
+    return m.mentionedJids.some((j) => mine.includes(jidNormalizedUser(j)));
   }
 
   private handleClose(code: number | null, reason?: string): void {

@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { TRACE_SCHEMA_SQL } from '../chatbot/models/trace.schema.js';
 import { AppConfig } from '../config/env.schema.js';
 import { MIGRATE_MESSAGES_SQL, SCHEMA_SQL } from './schema.sql.js';
 
@@ -25,6 +26,8 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     this.db.pragma('foreign_keys = ON');
     this.migrate();
     this.db.exec(SCHEMA_SQL);
+    this.db.exec(TRACE_SCHEMA_SQL);
+    this.ensureRetrievalIndexes();
     this.logger.log(`SQLite ready at ${file} (journal_mode=${this.db.pragma('journal_mode', { simple: true })})`);
   }
 
@@ -39,6 +42,25 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
   /** False once the connection has been closed (e.g. during shutdown). */
   get isOpen(): boolean {
     return !!this.db?.open;
+  }
+
+  /**
+   * The full-text index is maintained by triggers, but databases that already held messages
+   * before it existed (or whose rowids were renumbered by VACUUM) need a rebuild. Row counts
+   * are a cheap drift detector.
+   */
+  private ensureRetrievalIndexes(): void {
+    const count = (table: string) =>
+      (this.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+    if (count('messages') === count('messages_fts')) return;
+    this.logger.log('Rebuilding messages_fts (out of sync with messages)');
+    this.db.transaction(() => {
+      this.db.exec('DELETE FROM messages_fts');
+      this.db.exec(
+        `INSERT INTO messages_fts (rowid, text, session_id, group_id, message_id)
+         SELECT rowid, text, session_id, group_id, id FROM messages`,
+      );
+    })();
   }
 
   /** One-off upgrades of databases created by earlier versions. */

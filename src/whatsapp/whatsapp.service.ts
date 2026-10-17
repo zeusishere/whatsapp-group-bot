@@ -11,7 +11,7 @@ import pino from 'pino';
 import { AuthUser } from '../auth/auth.types.js';
 import { AppConfig } from '../config/env.schema.js';
 import { DatabaseService } from '../database/database.service.js';
-import { MessagesRepository } from '../messages/messages.repository.js';
+import { MessagesRepository, StoredMessage } from '../messages/messages.repository.js';
 import { SessionRecord, SessionsRepository } from '../sessions/sessions.repository.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { RuntimeDeps, SessionRuntime } from './session-runtime.js';
@@ -19,6 +19,9 @@ import { ConnectResult, GroupInfo, SessionStatus } from './whatsapp.types.js';
 
 /** How long `connect` waits for a QR / connection before answering with the current state. */
 const CONNECT_WAIT_MS = 15_000;
+
+/** Inbound group mention. Registered by ChatService; kept here so WhatsApp does not import chatbot. */
+export type MentionHandler = (deviceSessionId: string, message: StoredMessage) => void;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -33,6 +36,7 @@ export class WhatsappService implements OnModuleInit, OnApplicationBootstrap, On
   private readonly deps: RuntimeDeps;
   private heartbeat: NodeJS.Timeout | null = null;
   private shuttingDown = false;
+  private mentionHandler: MentionHandler | null = null;
 
   constructor(
     private readonly config: ConfigService<AppConfig, true>,
@@ -48,6 +52,7 @@ export class WhatsappService implements OnModuleInit, OnApplicationBootstrap, On
       baileysLogger: pino({ level: this.config.get('app', { infer: true }).logLevel }),
       reconnect: wa.reconnect,
       printQrInTerminal: wa.printQrInTerminal,
+      onMention: (deviceSessionId, message) => this.mentionHandler?.(deviceSessionId, message),
     };
   }
 
@@ -188,6 +193,28 @@ export class WhatsappService implements OnModuleInit, OnApplicationBootstrap, On
 
   sendMessage(user: AuthUser, id: string, dto: SendMessageDto) {
     return this.connectedRuntime(user, id).sendMessage(dto);
+  }
+
+  /**
+   * Registers the mention handler. ChatService is the only caller; a second registration
+   * replaces the first so tests can swap it.
+   */
+  setMentionHandler(handler: MentionHandler | null): void {
+    this.mentionHandler = handler;
+  }
+
+  /**
+   * Sends as a device session without an HTTP user. Used by the mention pipeline after
+   * ownership has already been established through the thread binding.
+   */
+  sendAsSession(sessionId: string, dto: SendMessageDto) {
+    const rec = this.sessions.findById(sessionId);
+    if (!rec) throw new ConflictException(`WhatsApp session ${sessionId} is gone`);
+    const runtime = this.runtimes.get(rec.id);
+    if (!runtime?.isConnected()) {
+      throw new ConflictException(`Session is not connected (state: ${runtime?.snapshot().state ?? rec.status})`);
+    }
+    return runtime.sendMessage(dto);
   }
 
   // ------------------------------------------------------------------ internals

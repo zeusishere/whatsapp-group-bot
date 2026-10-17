@@ -23,6 +23,8 @@ describe('validateConfig', () => {
     expect(cfg.whatsapp.restoreOnBoot).toBe(false);
     expect(cfg.whatsapp.reconnect).toEqual({ baseDelayMs: 500, maxDelayMs: 60000 });
     expect(cfg.auth).toEqual({ jwtSecret: SECRET, tokenTtlSeconds: 60, allowRegistration: true });
+    expect(cfg.llm.model).toBe(DEFAULT_CONFIG.llm.model);
+    expect(cfg.bot.retrievalTopK).toBe(DEFAULT_CONFIG.bot.retrievalTopK);
   });
 
   it('requires auth.jwtSecret', () => {
@@ -53,5 +55,24 @@ describe('validateConfig', () => {
   it('rejects non-object roots and sections', () => {
     expect(() => validateConfig([])).toThrow(/JSON object/);
     expect(() => validateConfig({ auth, app: 5 })).toThrow(/"app" must be an object/);
+  });
+
+  it('accepts an empty llm.apiKey (chat disabled) and merges bot/tracing overrides', () => {
+    const cfg = validateConfig({
+      auth,
+      llm: { apiKey: '', temperature: 0.5 },
+      bot: { retrievalTopK: 3, minSimilarity: 0.4 },
+      tracing: { redact: false },
+    });
+    expect(cfg.llm.apiKey).toBe('');
+    expect(cfg.llm.temperature).toBe(0.5);
+    expect(cfg.bot.retrievalTopK).toBe(3);
+    expect(cfg.bot.minSimilarity).toBe(0.4);
+    expect(cfg.tracing.redact).toBe(false);
+  });
+
+  it('rejects out-of-range bot and llm values', () => {
+    expect(() => validateConfig({ auth, llm: { temperature: 9 } })).toThrow(/temperature/);
+    expect(() => validateConfig({ auth, bot: { minSimilarity: 2 } })).toThrow(/minSimilarity/);
   });
 });

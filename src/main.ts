@@ -16,8 +16,8 @@ async function bootstrap() {
 
   const swagger = new DocumentBuilder()
     .setTitle('WhatsApp Group Agent')
-    .setDescription('Manage and inspect linked WhatsApp devices (Baileys sessions)')
-    .setVersion('0.2.0')
+    .setDescription('Manage linked WhatsApp devices and inspect traced bot turns')
+    .setVersion('0.3.0')
     .addBearerAuth()
     .build();
   SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, swagger));

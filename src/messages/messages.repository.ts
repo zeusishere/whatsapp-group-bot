@@ -50,8 +50,13 @@ function toMessage(r: MessageRow): StoredMessage {
   };
 }
 
+/** Called after a message has been newly stored (not for duplicates). Must not throw. */
+export type MessageInsertedListener = (sessionId: string, message: StoredMessage) => void;
+
 @Injectable()
 export class MessagesRepository {
+  private readonly insertListeners: MessageInsertedListener[] = [];
+
   constructor(
     private readonly database: DatabaseService,
     private readonly config: ConfigService<AppConfig, true>,
@@ -74,8 +79,32 @@ export class MessagesRepository {
         isBot: m.isBot ? 1 : 0,
         mentionedJids: JSON.stringify(m.mentionedJids),
       });
-    if (res.changes > 0) this.trim(sessionId, m.groupId);
+    if (res.changes > 0) {
+      this.trim(sessionId, m.groupId);
+      for (const listener of this.insertListeners) {
+        try {
+          listener(sessionId, m);
+        } catch {
+          // A faulty observer (e.g. the embedding queue) must never lose the message itself.
+        }
+      }
+    }
     return res.changes > 0;
+  }
+
+  /** Subscribes to newly stored messages. Used to index them for retrieval without coupling ingestion to it. */
+  onInserted(listener: MessageInsertedListener): void {
+    this.insertListeners.push(listener);
+  }
+
+  /** Loads several messages of a group by id (order not guaranteed). */
+  getByIds(sessionId: string, groupId: string, ids: string[]): StoredMessage[] {
+    if (!ids.length) return [];
+    const marks = ids.map(() => '?').join(',');
+    const rows = this.database.connection
+      .prepare(`SELECT * FROM messages WHERE session_id = ? AND group_id = ? AND id IN (${marks})`)
+      .all(sessionId, groupId, ...ids) as MessageRow[];
+    return rows.map(toMessage);
   }
 
   /** Keeps only the newest N messages for a group of a session (NFR-3). */
