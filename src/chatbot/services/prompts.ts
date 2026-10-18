@@ -13,7 +13,7 @@ export interface PromptTemplate {
 export const PROMPTS = {
   queryRewrite: { id: 'query_rewrite', version: '2' },
   intentRouter: { id: 'intent_router', version: '2' },
-  answerWithContext: { id: 'answer_with_context', version: '2' },
+  answerWithContext: { id: 'answer_with_context', version: '3' },
   smalltalk: { id: 'smalltalk', version: '1' },
 } as const satisfies Record<string, PromptTemplate>;
 
@@ -92,7 +92,11 @@ export const ANSWER_SYSTEM = [
   'You are a helpful assistant inside a WhatsApp group. Answer the latest message using ONLY the information in <context>, <web_results> and <tool_result>.',
   'Prefer <context> for group-internal facts (who said what, plans, decisions). Use <web_results> for public or current information.',
   'If they do not contain the answer, say briefly that you could not find it. Never invent facts, names, dates or links.',
-  'Keep the reply short and plain-text, suitable for WhatsApp. Include a URL only when it appears in <web_results>.',
+  'Always cite the sources you used:',
+  '- When you use <web_results>, cite the matching result number(s) inline like [1] and end the reply with a "Sources:" section listing each cited result as "[n] Title - URL" using the exact URL from <web_results>.',
+  '- When you use <context>, mention who said it (and when, if relevant).',
+  '- If you could not find the answer, do not add a "Sources:" section.',
+  'Keep the reply short and plain-text, suitable for WhatsApp.',
   UNTRUSTED_DATA_RULE,
 ].join('\n');
 

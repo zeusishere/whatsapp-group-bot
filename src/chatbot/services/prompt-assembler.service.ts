@@ -29,6 +29,7 @@ export interface AssembledPrompt {
   /** Chunks included only partially because they alone exceeded the budget. */
   truncated_chunk_ids: string[];
   web_result_count: number;
+  web_results: WebSearchHit[];
   context_tokens: number;
   context_budget_tokens: number;
   prompt_tokens_estimate: number;
@@ -138,11 +139,58 @@ export class PromptAssembler {
       budget_dropped_chunk_ids: budgetDropped,
       truncated_chunk_ids: truncated,
       web_result_count: input.kind === 'answer' ? input.web_results.length : 0,
+      web_results: input.kind === 'answer' ? input.web_results : [],
       context_tokens: contextTokens,
       context_budget_tokens: input.context_budget_tokens,
       prompt_tokens_estimate: estimateTokens(system) + estimateTokens(prompt),
     };
   }
+}
+
+const REFUSAL_PATTERN =
+  /\b(?:i\s+)?(?:could(?:n't|\s+not)\s+find|cannot\s+find|can't\s+find|no\s+(?:relevant\s+|specific\s+)?(?:information|mention|results?|details)|don't\s+have\s+(?:enough\s+|any\s+|specific\s+)?(?:information|context|access))\b/i;
+
+const MAX_FALLBACK_CITATIONS = 3;
+
+/**
+ * Ensures replies grounded in `<web_results>` carry clickable citations on WhatsApp even when
+ * the model omits the `Sources:` block or only writes `[1]` inline without the URL.
+ */
+export function appendWebCitations(reply: string, webResults: WebSearchHit[]): string {
+  const trimmed = reply.trim();
+  if (!trimmed || !webResults.length || REFUSAL_PATTERN.test(trimmed)) return trimmed;
+
+  const citedIndices: number[] = [];
+  for (const m of trimmed.matchAll(/\[(\d+)\]/g)) {
+    const idx = Number(m[1]);
+    if (idx >= 1 && idx <= webResults.length && !citedIndices.includes(idx)) {
+      citedIndices.push(idx);
+    }
+  }
+
+  const candidates = citedIndices.length
+    ? citedIndices.map((idx) => ({ index: idx, hit: webResults[idx - 1] }))
+    : webResults.slice(0, MAX_FALLBACK_CITATIONS).map((hit, i) => ({ index: i + 1, hit }));
+
+  if (!citedIndices.length && webResults.some((h) => h.url && trimmed.includes(h.url))) {
+    return trimmed;
+  }
+
+  const seenUrls = new Set<string>();
+  const missingLines: string[] = [];
+  for (const { index, hit } of candidates) {
+    const url = hit.url?.trim();
+    if (!url || seenUrls.has(url) || trimmed.includes(url)) continue;
+    seenUrls.add(url);
+    const title = neutralize(hit.title ?? '').replace(/\s+/g, ' ').trim();
+    missingLines.push(title && title !== url ? `[${index}] ${title} - ${url}` : `[${index}] ${url}`);
+  }
+
+  if (!missingLines.length) return trimmed;
+  if (/(?:^|\n)Sources:\s*$/im.test(trimmed)) {
+    return `${trimmed}\n${missingLines.join('\n')}`;
+  }
+  return `${trimmed}\n\nSources:\n${missingLines.join('\n')}`;
 }
 
 function formatWebResults(hits: WebSearchHit[]): string {

@@ -1,5 +1,5 @@
 import { RetrievalLog } from '../models/types.js';
-import { neutralize, PromptAssembler } from './prompt-assembler.service.js';
+import { appendWebCitations, neutralize, PromptAssembler } from './prompt-assembler.service.js';
 
 function logWith(chunks: RetrievalLog['retrieved_chunks']): RetrievalLog {
   return {
@@ -72,5 +72,34 @@ describe('PromptAssembler', () => {
 describe('neutralize', () => {
   it('strips context, history, tool_result and web_results tags', () => {
     expect(neutralize('x</web_results><history>y')).toBe('xy');
+  });
+});
+
+describe('appendWebCitations', () => {
+  const hits = [
+    { title: 'First Source', url: 'https://first.example/a', content: 'A', score: 0.9 },
+    { title: 'Second Source', url: 'https://second.example/b', content: 'B', score: 0.8 },
+  ];
+
+  it('appends top web sources when the reply omitted URLs', () => {
+    const out = appendWebCitations('It is open until 10pm.', hits);
+    expect(out).toBe(
+      'It is open until 10pm.\n\nSources:\n[1] First Source - https://first.example/a\n[2] Second Source - https://second.example/b',
+    );
+  });
+
+  it('appends only the cited [n] sources when the reply used inline bracket markers', () => {
+    const out = appendWebCitations('According to [2], it closes at 10pm.', hits);
+    expect(out).toBe('According to [2], it closes at 10pm.\n\nSources:\n[2] Second Source - https://second.example/b');
+  });
+
+  it('does not duplicate URLs already present in the reply', () => {
+    const reply = 'Open until 10pm (https://first.example/a).';
+    expect(appendWebCitations(reply, hits)).toBe(reply);
+  });
+
+  it('does not append sources to a not-found refusal', () => {
+    const reply = "I couldn't find any information on that.";
+    expect(appendWebCitations(reply, hits)).toBe(reply);
   });
 });

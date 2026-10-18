@@ -5,7 +5,7 @@ import { CodedError, errorCode } from '../models/errors.js';
 import { Json, Message } from '../models/types.js';
 import { LlmClient, LlmError } from '../llm/llm-client.js';
 import { TraceCollector } from '../tracing/trace-collector.js';
-import { AssembledPrompt } from './prompt-assembler.service.js';
+import { AssembledPrompt, appendWebCitations } from './prompt-assembler.service.js';
 import {
   INTENT_ROUTER_SCHEMA,
   PROMPTS,
@@ -339,13 +339,20 @@ export class DecisionEngine {
               maxOutputTokens: this.bot.maxOutputTokens,
             });
             span.addTokens(response.usage);
-            span.setOutcome({ finish_reason: response.finish_reason, output_chars: response.text.length, usage: { ...response.usage } });
+            const rawReply = response.text.trim();
+            const reply = appendWebCitations(rawReply, prompt.web_results ?? []);
+            span.setOutcome({
+              finish_reason: response.finish_reason,
+              output_chars: reply.length,
+              citations_appended: reply !== rawReply,
+              usage: { ...response.usage },
+            });
             span.setRationale(
               prompt.included_chunk_ids.length || prompt.web_result_count
                 ? `Answered from ${prompt.included_chunk_ids.length} retrieved chunk(s) and ${prompt.web_result_count} web result(s) within a ${prompt.context_budget_tokens}-token context budget.`
                 : 'Generated without retrieved context.',
             );
-            return response.text.trim();
+            return reply;
           } catch (e) {
             if (e instanceof LlmError && e.retryable && attempt < maxAttempts) {
               span.setStatus('RETRYING');

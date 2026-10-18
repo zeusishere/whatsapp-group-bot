@@ -264,7 +264,7 @@ describe('ChatPipelineService', () => {
       );
 
       expect(turn.status).toBe('COMPLETED');
-      expect(turn.bot_reply_raw).toBe('Tuesday, according to the web.');
+      expect(turn.bot_reply_raw).toBe('Tuesday, according to the web.\n\nSources:\n[1] Launch - https://example.com/launch');
       const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
       expect(types).toContain('WEB_SEARCH');
       expect(types).not.toContain('CONTEXT_RETRIEVAL');
