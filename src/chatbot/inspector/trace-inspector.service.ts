@@ -63,6 +63,7 @@ const STAGE_OF: Record<StepType, TimelineStage> = {
   INTENT_ROUTER: 'Decision/Routing',
   GUARDRAIL_CHECK: 'Decision/Routing',
   CONTEXT_RETRIEVAL: 'Context Retrieval',
+  WEB_SEARCH: 'Context Retrieval',
   TOOL_EXECUTION: 'Tool Calls',
   PROMPT_ASSEMBLY: 'Prompt Assembly',
   LLM_GENERATION: 'Final Reply',
@@ -201,8 +202,10 @@ export class TraceInspectorService {
       });
     }
     const retrievalSpan = spans.find((s) => s.step_type === 'CONTEXT_RETRIEVAL' && retrievals.some((r) => r.span_id === s.span_id));
+    const webSpan = spans.find((s) => s.step_type === 'WEB_SEARCH');
     const assembly = spans.find((s) => s.step_type === 'PROMPT_ASSEMBLY');
     if (retrievalSpan && assembly) edges.push({ from: retrievalSpan.span_id, to: assembly.span_id, kind: 'data' });
+    if (webSpan && assembly) edges.push({ from: webSpan.span_id, to: assembly.span_id, kind: 'data' });
 
     if (turn.bot_message_id && spans.length) {
       edges.push({ from: spans[spans.length - 1].span_id, to: `msg:${turn.bot_message_id}`, kind: 'sequence' });

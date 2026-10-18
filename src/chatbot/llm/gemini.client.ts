@@ -89,9 +89,10 @@ export class GeminiLlmClient extends LlmClient {
           ...(request.json
             ? { responseMimeType: 'application/json', ...(request.jsonSchema ? { responseJsonSchema: request.jsonSchema } : {}) }
             : {}),
-          // 2.5-flash "thinks" by default and bills those tokens against maxOutputTokens, which can
+          // (*)-flash model "thinks" by default and bills those tokens against maxOutputTokens, which can
           // truncate short structured answers. Routing/rewrite/answers here need no deliberation.
-          ...(/2\.5-flash/.test(this.model_name) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+          ...(/flash/i.test(this.model_name) ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+
         },
       }),
     );

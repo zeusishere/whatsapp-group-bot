@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS decision_spans (
   parent_span_id   TEXT,
   sequence_order   INTEGER NOT NULL,
   step_type        TEXT NOT NULL CHECK (step_type IN (
-    'QUERY_REWRITE','INTENT_ROUTER','GUARDRAIL_CHECK','CONTEXT_RETRIEVAL','TOOL_EXECUTION',
+    'QUERY_REWRITE','INTENT_ROUTER','GUARDRAIL_CHECK','CONTEXT_RETRIEVAL','WEB_SEARCH','TOOL_EXECUTION',
     'PROMPT_ASSEMBLY','LLM_GENERATION','FALLBACK_HANDLER','LOW_CONFIDENCE_CONTEXT')),
   input_state      TEXT NOT NULL DEFAULT '{}',
   decision_outcome TEXT,
@@ -138,4 +138,33 @@ CREATE TRIGGER IF NOT EXISTS trg_messages_embeddings_delete AFTER DELETE ON mess
   DELETE FROM message_embeddings
   WHERE session_id = old.session_id AND group_id = old.group_id AND message_id = old.id;
 END;
+`;
+
+/**
+ * Rebuilds `decision_spans` so existing databases pick up a new `step_type` CHECK value.
+ * SQLite cannot ALTER a CHECK constraint in place. Foreign keys are off for the swap.
+ */
+export const MIGRATE_DECISION_SPANS_WEB_SEARCH_SQL = `
+CREATE TABLE decision_spans_new (
+  span_id          TEXT PRIMARY KEY,
+  turn_id          TEXT NOT NULL REFERENCES conversation_turns(turn_id) ON DELETE CASCADE,
+  parent_span_id   TEXT,
+  sequence_order   INTEGER NOT NULL,
+  step_type        TEXT NOT NULL CHECK (step_type IN (
+    'QUERY_REWRITE','INTENT_ROUTER','GUARDRAIL_CHECK','CONTEXT_RETRIEVAL','WEB_SEARCH','TOOL_EXECUTION',
+    'PROMPT_ASSEMBLY','LLM_GENERATION','FALLBACK_HANDLER','LOW_CONFIDENCE_CONTEXT')),
+  input_state      TEXT NOT NULL DEFAULT '{}',
+  decision_outcome TEXT,
+  rationale        TEXT,
+  model_config     TEXT,
+  status           TEXT NOT NULL CHECK (status IN ('SUCCESS','RETRYING','FALLBACK','ERROR')),
+  started_at       INTEGER NOT NULL,
+  ended_at         INTEGER NOT NULL,
+  duration_ms      INTEGER NOT NULL,
+  UNIQUE (turn_id, sequence_order)
+);
+INSERT INTO decision_spans_new SELECT * FROM decision_spans;
+DROP TABLE decision_spans;
+ALTER TABLE decision_spans_new RENAME TO decision_spans;
+CREATE INDEX IF NOT EXISTS idx_spans_parent ON decision_spans (parent_span_id);
 `;

@@ -60,6 +60,12 @@ export interface AppConfig {
     previewChars: number;
     maxFieldChars: number;
   };
+  /** Tavily web search. Empty `apiKey` disables web / hybrid search (message search still works). */
+  webSearch: {
+    apiKey: string;
+    maxResults: number;
+    timeoutMs: number;
+  };
 }
 
 export const LOG_LEVELS: LogLevel[] = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'];
@@ -99,4 +105,5 @@ export const DEFAULT_CONFIG: AppConfig = {
       "I couldn't find enough relevant context in this chat to answer that reliably. Could you rephrase or add more detail?",
   },
   tracing: { redact: true, previewChars: 240, maxFieldChars: 4000 },
+  webSearch: { apiKey: '', maxResults: 5, timeoutMs: 10_000 },
 };

@@ -62,6 +62,7 @@ export function validateConfig(raw: unknown): AppConfig {
   const llm = section('llm');
   const bot = section('bot');
   const tr = section('tracing');
+  const web = section('webSearch');
   const isUnit = (v: unknown) => typeof v === 'number' && v >= 0 && v <= 1;
   const isTemp = (v: unknown) => typeof v === 'number' && v >= 0 && v <= 2;
   const isRetries = (v: unknown) => Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 5;
@@ -200,6 +201,11 @@ export function validateConfig(raw: unknown): AppConfig {
       redact: pick(tr, 'tracing', 'redact', d.tracing.redact, isBool, 'a boolean'),
       previewChars: pick(tr, 'tracing', 'previewChars', d.tracing.previewChars, isPosInt, 'a positive integer'),
       maxFieldChars: pick(tr, 'tracing', 'maxFieldChars', d.tracing.maxFieldChars, isPosInt, 'a positive integer'),
+    },
+    webSearch: {
+      apiKey: pick(web, 'webSearch', 'apiKey', d.webSearch.apiKey, isApiKey, 'a string (empty disables web search)'),
+      maxResults: pick(web, 'webSearch', 'maxResults', d.webSearch.maxResults, isPosInt, 'a positive integer'),
+      timeoutMs: pick(web, 'webSearch', 'timeoutMs', d.webSearch.timeoutMs, isPosInt, 'a positive integer'),
     },
   };
 

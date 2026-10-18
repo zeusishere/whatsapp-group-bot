@@ -13,6 +13,8 @@ import {
   QUERY_REWRITE_SYSTEM,
   ROUTES,
   Route,
+  SEARCH_SOURCES,
+  SearchSource,
   intentRouterSystem,
   modelConfig,
 } from './prompts.js';
@@ -35,6 +37,7 @@ export interface GuardrailVerdict {
 
 export interface RouteDecision {
   route: Route;
+  search_source: SearchSource;
   confidence: number;
   rationale: string;
   tool: string | null;
@@ -63,7 +66,7 @@ const FALLBACK_REPLIES: Record<Exclude<FallbackCode, 'LOW_CONFIDENCE_CONTEXT'>, 
   EMPTY_INPUT: 'Please send a message with some text and I will try to help.',
   INPUT_TOO_LONG: 'That message is too long for me to process. Could you shorten it?',
   PROMPT_INJECTION: "I can't help with that request.",
-  OUT_OF_SCOPE: 'I can only help with questions about this chat.',
+  OUT_OF_SCOPE: "I can't help with that request.",
 };
 
 /**
@@ -79,6 +82,7 @@ const FALLBACK_REPLIES: Record<Exclude<FallbackCode, 'LOW_CONFIDENCE_CONTEXT'>, 
 export class DecisionEngine {
   private readonly bot: AppConfig['bot'];
   private readonly llmCfg: AppConfig['llm'];
+  private readonly webSearchEnabled: boolean;
 
   constructor(
     private readonly llm: LlmClient,
@@ -87,6 +91,7 @@ export class DecisionEngine {
   ) {
     this.bot = config.get('bot', { infer: true });
     this.llmCfg = config.get('llm', { infer: true });
+    this.webSearchEnabled = config.get('webSearch', { infer: true }).apiKey.length > 0;
   }
 
   // ---------------------------------------------------------------- guardrail
@@ -178,14 +183,25 @@ export class DecisionEngine {
       input: { question: ctx.question, quoted_message_id: ctx.quoted_message_id, tools: this.tools.list().map((t) => t.name) },
       validate: (raw) => this.validateRoute(raw),
       describe: (d) => ({
-        outcome: { selected_route: d.route, confidence: d.confidence, ...(d.tool ? { tool_called: d.tool, args: d.args } : {}) },
+        outcome: {
+          selected_route: d.route,
+          search_source: d.search_source,
+          confidence: d.confidence,
+          ...(d.tool ? { tool_called: d.tool, args: d.args } : {}),
+        },
         rationale: d.rationale,
       }),
       fallback: () => {
         const d = heuristicRoute(ctx.question, ctx.quoted_message_id);
         return {
           value: d,
-          outcome: { selected_route: d.route, confidence: d.confidence, method: 'rules', ...(d.tool ? { tool_called: d.tool, args: d.args } : {}) },
+          outcome: {
+            selected_route: d.route,
+            search_source: d.search_source,
+            confidence: d.confidence,
+            method: 'rules',
+            ...(d.tool ? { tool_called: d.tool, args: d.args } : {}),
+          },
           rationale: d.rationale,
         };
       },
@@ -201,12 +217,16 @@ export class DecisionEngine {
     }
     if (typeof o.confidence !== 'number' || !Number.isFinite(o.confidence)) throw new SchemaError('"confidence" must be a number');
     if (typeof o.rationale !== 'string' || !o.rationale.trim()) throw new SchemaError('"rationale" must be a non-empty string');
+    if (o.search_source !== undefined && (typeof o.search_source !== 'string' || !(SEARCH_SOURCES as readonly string[]).includes(o.search_source))) {
+      throw new SchemaError(`"search_source" must be one of: ${SEARCH_SOURCES.join(', ')}`);
+    }
 
     let route = o.route as Route;
     const confidence = Math.min(1, Math.max(0, o.confidence));
     let rationale = o.rationale.trim().slice(0, 1000);
     let tool: string | null = null;
     let args: Record<string, Json> = {};
+    let search_source = coerceSearchSource(route, o.search_source);
 
     if (route === 'use_tool') {
       const def = typeof o.tool === 'string' ? this.tools.get(o.tool) : undefined;
@@ -224,8 +244,15 @@ export class DecisionEngine {
       route = 'answer_from_context';
       tool = null;
       args = {};
+      if (search_source === 'none') search_source = 'messages';
     }
-    return { route, confidence, rationale, tool, args };
+
+    if ((search_source === 'web' || search_source === 'hybrid') && !this.webSearchEnabled) {
+      rationale += ' (Overridden: web search is not configured; searching group messages instead.)';
+      search_source = 'messages';
+    }
+
+    return { route, search_source, confidence, rationale, tool, args };
   }
 
   // --------------------------------------------------------------------- tools
@@ -255,16 +282,19 @@ export class DecisionEngine {
   /** Low-confidence context: records the decision, then lets the caller trigger the fallback reply. */
   async lowConfidenceContext(
     collector: TraceCollector,
-    detail: { candidates: number; best_similarity: number | null; min_similarity: number; drop_reasons: Record<string, number> },
+    detail: {
+      candidates: number;
+      best_similarity: number | null;
+      min_similarity: number;
+      drop_reasons: Record<string, number>;
+      search_source: SearchSource;
+      web_results: number;
+    },
   ): Promise<void> {
     await collector.span('LOW_CONFIDENCE_CONTEXT', { ...detail }, (span) => {
       span.setStatus('FALLBACK');
       span.setOutcome({ code: 'LOW_CONFIDENCE_CONTEXT', action: 'deterministic_fallback', ...detail });
-      span.setRationale(
-        detail.candidates === 0
-          ? 'Retrieval returned no candidates, so answering would require guessing. Using the deterministic fallback instead of generating.'
-          : `None of ${detail.candidates} candidate(s) cleared the relevance threshold. Using the deterministic fallback instead of generating from weak context.`,
-      );
+      span.setRationale(lowConfidenceRationale(detail));
     });
   }
 
@@ -311,8 +341,8 @@ export class DecisionEngine {
             span.addTokens(response.usage);
             span.setOutcome({ finish_reason: response.finish_reason, output_chars: response.text.length, usage: { ...response.usage } });
             span.setRationale(
-              prompt.included_chunk_ids.length
-                ? `Answered from ${prompt.included_chunk_ids.length} retrieved chunk(s) within a ${prompt.context_budget_tokens}-token context budget.`
+              prompt.included_chunk_ids.length || prompt.web_result_count
+                ? `Answered from ${prompt.included_chunk_ids.length} retrieved chunk(s) and ${prompt.web_result_count} web result(s) within a ${prompt.context_budget_tokens}-token context budget.`
                 : 'Generated without retrieved context.',
             );
             return response.text.trim();
@@ -360,11 +390,19 @@ export function heuristicQueries(question: string): string[] {
 export function heuristicRoute(question: string, quotedMessageId: string | null): RouteDecision {
   const text = question.trim();
   if (/\b(?:what(?:'s| is) the (?:time|date)|current (?:time|date)|today'?s date|what day is it)\b/i.test(text)) {
-    return { route: 'use_tool', confidence: 0.6, rationale: 'Rule: the message asks for the current date or time.', tool: 'current_datetime', args: {} };
+    return {
+      route: 'use_tool',
+      search_source: 'none',
+      confidence: 0.6,
+      rationale: 'Rule: the message asks for the current date or time.',
+      tool: 'current_datetime',
+      args: {},
+    };
   }
   if (quotedMessageId && text.length <= 140) {
     return {
       route: 'use_tool',
+      search_source: 'messages',
       confidence: 0.5,
       rationale: 'Rule: a short reply to an earlier message; fetching that message for context.',
       tool: 'lookup_quoted_message',
@@ -372,7 +410,44 @@ export function heuristicRoute(question: string, quotedMessageId: string | null)
     };
   }
   if (/^(?:hi|hello|hey|thanks|thank you|thx|good (?:morning|afternoon|evening|night))\b[\s!.?,]*$/i.test(text)) {
-    return { route: 'smalltalk', confidence: 0.6, rationale: 'Rule: the message is a greeting or thanks.', tool: null, args: {} };
+    return {
+      route: 'smalltalk',
+      search_source: 'none',
+      confidence: 0.6,
+      rationale: 'Rule: the message is a greeting or thanks.',
+      tool: null,
+      args: {},
+    };
   }
-  return { route: 'answer_from_context', confidence: 0.4, rationale: 'Rule: default route; search the chat history for an answer.', tool: null, args: {} };
+  return {
+    route: 'answer_from_context',
+    search_source: 'messages',
+    confidence: 0.4,
+    rationale: 'Rule: default route; search the chat history for an answer.',
+    tool: null,
+    args: {},
+  };
+}
+
+function coerceSearchSource(route: Route, raw: unknown): SearchSource {
+  if (route === 'smalltalk' || route === 'out_of_scope') return 'none';
+  const source = typeof raw === 'string' && (SEARCH_SOURCES as readonly string[]).includes(raw) ? (raw as SearchSource) : 'messages';
+  if (route === 'answer_from_context' && source === 'none') return 'messages';
+  return source;
+}
+
+function lowConfidenceRationale(detail: {
+  candidates: number;
+  search_source: SearchSource;
+  web_results: number;
+}): string {
+  if (detail.search_source === 'web') {
+    return 'Web search returned no usable results, so answering would require guessing. Using the deterministic fallback instead of generating.';
+  }
+  if (detail.search_source === 'hybrid') {
+    return 'Neither group messages nor web search produced usable results. Using the deterministic fallback instead of generating.';
+  }
+  return detail.candidates === 0
+    ? 'Retrieval returned no candidates, so answering would require guessing. Using the deterministic fallback instead of generating.'
+    : `None of ${detail.candidates} candidate(s) cleared the relevance threshold. Using the deterministic fallback instead of generating from weak context.`;
 }

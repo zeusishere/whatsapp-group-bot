@@ -5,6 +5,7 @@ import { PromptAssembler } from '../services/prompt-assembler.service.js';
 import { HeuristicReranker } from '../services/reranker.js';
 import { RetrievalService } from '../services/retrieval.service.js';
 import { ToolRegistry } from '../services/tool.registry.js';
+import { WebSearchService } from '../services/web-search.service.js';
 import { configService, jsonReply, openTestDb, StubEmbeddings, StubLlm, testConfig, textReply } from '../testing/harness.js';
 import { TraceInspectorService } from '../inspector/trace-inspector.service.js';
 import { ChatPipelineService } from './chat-pipeline.service.js';
@@ -19,7 +20,8 @@ function build(opts?: { llm?: StubLlm; cfg?: ReturnType<typeof testConfig> }) {
   const tools = new ToolRegistry(h.messages);
   const decisions = new DecisionEngine(llm, tools, configService(cfg));
   const assembler = new PromptAssembler();
-  const pipeline = new ChatPipelineService(decisions, retrieval, assembler, configService(cfg));
+  const web = new WebSearchService(configService(cfg));
+  const pipeline = new ChatPipelineService(decisions, retrieval, assembler, web, configService(cfg));
   const inspector = new TraceInspectorService(h.repo);
   return { ...h, llm, pipeline, inspector, cfg };
 }
@@ -217,5 +219,119 @@ describe('ChatPipelineService', () => {
     expect(second.turnId).toBe(first.turnId);
     expect(second.reply).toBe(first.reply);
     expect(h.repo.getSpans(first.turnId).filter((s) => s.step_type === 'LLM_GENERATION')).toHaveLength(1);
+  });
+
+  describe('web vs message vs hybrid search', () => {
+    const originalFetch = globalThis.fetch;
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    function mockTavily(results: { title: string; url: string; content: string; score: number }[]) {
+      globalThis.fetch = (async () => ({
+        ok: true,
+        json: async () => ({ results }),
+        text: async () => '',
+      })) as unknown as typeof fetch;
+    }
+
+    const webCfg = () => testConfig({ webSearch: { apiKey: 'tvly-test', maxResults: 5, timeoutMs: 10000 } });
+
+    it('web-only skips message retrieval and answers from Tavily', async () => {
+      const h = build({ cfg: webCfg() });
+      mockTavily([{ title: 'Launch', url: 'https://example.com/launch', content: 'The launch is Tuesday.', score: 0.9 }]);
+      scripted(h.llm, {
+        route: { route: 'answer_from_context', search_source: 'web', confidence: 0.9, rationale: 'public fact' },
+        answer: 'Tuesday, according to the web.',
+      });
+
+      const claim = h.trace.claim({
+        session_id: h.thread.session_id,
+        idempotency_key: 'web-only',
+        user_input_raw: 'when is the product launching?',
+        user_external_id: null,
+      });
+      if (!claim.created) throw new Error('expected create');
+      const turn = await claim.collector.run((c) =>
+        h.pipeline.execute(c, {
+          thread: h.thread,
+          question: 'when is the product launching?',
+          history: [],
+          inbound_external_id: null,
+          quoted_message_id: null,
+        }),
+      );
+
+      expect(turn.status).toBe('COMPLETED');
+      expect(turn.bot_reply_raw).toBe('Tuesday, according to the web.');
+      const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
+      expect(types).toContain('WEB_SEARCH');
+      expect(types).not.toContain('CONTEXT_RETRIEVAL');
+      expect(types).toContain('LLM_GENERATION');
+    });
+
+    it('hybrid generates when chat retrieval is empty but the web hits', async () => {
+      const h = build({ cfg: webCfg() });
+      mockTavily([{ title: 'Hours', url: 'https://example.com/hours', content: 'Open until 10pm.', score: 0.8 }]);
+      scripted(h.llm, {
+        route: { route: 'answer_from_context', search_source: 'hybrid', confidence: 0.9, rationale: 'place in chat plus hours' },
+        answer: 'It is open until 10pm.',
+      });
+
+      const claim = h.trace.claim({
+        session_id: h.thread.session_id,
+        idempotency_key: 'hybrid-web',
+        user_input_raw: 'is that restaurant still open?',
+        user_external_id: null,
+      });
+      if (!claim.created) throw new Error('expected create');
+      const turn = await claim.collector.run((c) =>
+        h.pipeline.execute(c, {
+          thread: h.thread,
+          question: 'is that restaurant still open?',
+          history: [],
+          inbound_external_id: null,
+          quoted_message_id: null,
+        }),
+      );
+
+      expect(turn.status).toBe('COMPLETED');
+      const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
+      expect(types).toContain('CONTEXT_RETRIEVAL');
+      expect(types).toContain('WEB_SEARCH');
+      expect(types).toContain('LLM_GENERATION');
+      expect(types).not.toContain('FALLBACK_HANDLER');
+    });
+
+    it('falls back when hybrid finds nothing in chat or on the web', async () => {
+      const h = build({ cfg: webCfg() });
+      mockTavily([]);
+      scripted(h.llm, {
+        route: { route: 'answer_from_context', search_source: 'hybrid', confidence: 0.9, rationale: 'needs both' },
+      });
+
+      const claim = h.trace.claim({
+        session_id: h.thread.session_id,
+        idempotency_key: 'hybrid-empty',
+        user_input_raw: 'what is the secret code?',
+        user_external_id: null,
+      });
+      if (!claim.created) throw new Error('expected create');
+      const turn = await claim.collector.run((c) =>
+        h.pipeline.execute(c, {
+          thread: h.thread,
+          question: 'what is the secret code?',
+          history: [],
+          inbound_external_id: null,
+          quoted_message_id: null,
+        }),
+      );
+
+      expect(turn.status).toBe('FALLBACK_TRIGGERED');
+      const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
+      expect(types).toContain('LOW_CONFIDENCE_CONTEXT');
+      expect(types).not.toContain('LLM_GENERATION');
+    });
   });
 });

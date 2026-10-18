@@ -93,9 +93,11 @@ roughly when the process died.
 Set `llm.apiKey` (a Gemini key). Without it, ingestion still works and `POST /api/chat` returns 503.
 
 The bot replies when it is **@-mentioned** in a group (JID or LID), or when you call `POST /api/chat`.
-Each request is a *turn* with a ULID `turnId`. Retrieval is hybrid: SQLite FTS5 (BM25) plus stored
-Gemini embeddings, fused with reciprocal-rank fusion. If embeddings are unavailable it degrades to
-keyword search and records that in the trace.
+Each request is a *turn* with a ULID `turnId`. The intent router also picks a **search source**:
+group messages, the public web (Tavily), or both. Message retrieval is hybrid SQLite FTS5 (BM25)
+plus stored Gemini embeddings, fused with reciprocal-rank fusion. If embeddings are unavailable it
+degrades to keyword search. Set `webSearch.apiKey` to enable web / hybrid; with an empty key the
+router falls back to searching the chat.
 
 ```bash
 # continue after linking a device (ID = device session, TOKEN as above)
@@ -151,6 +153,9 @@ file. The file is validated at startup and the app refuses to boot on invalid va
 | `tracing.redact` | `true` | Mask secrets and PII in trace payloads |
 | `tracing.previewChars` | `240` | Max characters of a chunk preview |
 | `tracing.maxFieldChars` | `4000` | Truncate any trace string longer than this |
+| `webSearch.apiKey` | `""` | Tavily API key; empty disables web / hybrid search |
+| `webSearch.maxResults` | `5` | Max Tavily hits admitted to the prompt |
+| `webSearch.timeoutMs` | `10000` | Tavily HTTP timeout |
 
 ## API
 
@@ -223,5 +228,5 @@ env.example.json          config template
 
 1. **Foundation:** project setup, Baileys connection API, multi-device sessions, JWT, message storage.
 2. **Traced bot (this step):** mention replies, hybrid retrieval, Gemini generation, turn/span/retrieval audit, debug API.
-3. Cross-encoder reranker, Tavily / Jina tools, typing presence and outbound rate limiting.
+3. Cross-encoder reranker, typing presence and outbound rate limiting.
 4. Offline evaluation harness.

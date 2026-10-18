@@ -2,12 +2,14 @@ import { Injectable } from '@nestjs/common';
 import { Json, MessageRole, RetrievalLog } from '../models/types.js';
 import { ANSWER_SYSTEM, PROMPTS, PromptTemplate, SMALLTALK_SYSTEM } from './prompts.js';
 import { estimateTokens, truncateToTokens } from './text-utils.js';
+import { WebSearchHit } from './web-search.service.js';
 
 export interface AssembleInput {
   question: string;
   history: { role: MessageRole; content: string }[];
   /** The retrieval log whose chunks are admitted to (or dropped from) the prompt. Mutated in place. */
   retrieval: { log: RetrievalLog; texts: Map<string, string>; senders: Map<string, string> } | null;
+  web_results: WebSearchHit[];
   tool_results: { tool: string; result: Json }[];
   /** `smalltalk` prompts carry no retrieved context. */
   kind: 'answer' | 'smalltalk';
@@ -26,6 +28,7 @@ export interface AssembledPrompt {
   budget_dropped_chunk_ids: string[];
   /** Chunks included only partially because they alone exceeded the budget. */
   truncated_chunk_ids: string[];
+  web_result_count: number;
   context_tokens: number;
   context_budget_tokens: number;
   prompt_tokens_estimate: number;
@@ -38,12 +41,12 @@ const CHUNK_OVERHEAD_TOKENS = 12;
 /**
  * Builds the model prompt and enforces the context-window budget.
  *
- * Context overflow (edge case): relevant chunks are admitted best-first until the budget (or the
- * chunk cap) is reached. Every chunk that does not fit is written back into the retrieval log as
- * `used_in_final_prompt: false` + `TOKEN_BUDGET_EXCEEDED`, so the audit trail states exactly
- * what the model did not see. The one exception is when even the best chunk alone is larger
- * than the budget: it is truncated rather than dropped, because answering with no context at all
- * would be worse than answering with part of the most relevant message.
+ * Web snippets are reserved first so a hybrid turn cannot spend the whole budget on chat
+ * messages and drop the public-web evidence. Remaining budget is then filled with group
+ * messages, best-first. Overflow (edge case): leftover relevant chunks are written back into
+ * the retrieval log as `used_in_final_prompt: false` + `TOKEN_BUDGET_EXCEEDED`. The one
+ * exception is when even the best chunk alone is larger than the leftover budget: it is
+ * truncated rather than dropped.
  */
 @Injectable()
 export class PromptAssembler {
@@ -52,6 +55,10 @@ export class PromptAssembler {
     const budgetDropped: string[] = [];
     const truncated: string[] = [];
     let contextTokens = 0;
+
+    const webBlock = input.kind === 'answer' ? formatWebResults(input.web_results) : '';
+    const webTokens = webBlock ? estimateTokens(webBlock) : 0;
+    const messageBudget = Math.max(1, input.context_budget_tokens - webTokens);
 
     if (input.kind === 'answer' && input.retrieval) {
       const { log, texts, senders } = input.retrieval;
@@ -68,12 +75,12 @@ export class PromptAssembler {
           budgetDropped.push(chunk.chunk_id);
           continue;
         }
-        if (included.length === 0 && cost > input.context_budget_tokens) {
-          text = truncateToTokens(text, Math.max(1, input.context_budget_tokens - CHUNK_OVERHEAD_TOKENS));
+        if (included.length === 0 && cost > messageBudget) {
+          text = truncateToTokens(text, Math.max(1, messageBudget - CHUNK_OVERHEAD_TOKENS));
           cost = estimateTokens(text) + CHUNK_OVERHEAD_TOKENS;
           truncated.push(chunk.chunk_id);
           chunk.metadata = { ...chunk.metadata, truncated_for_budget: true };
-        } else if (contextTokens + cost > input.context_budget_tokens) {
+        } else if (contextTokens + cost > messageBudget) {
           chunk.drop_reason = 'TOKEN_BUDGET_EXCEEDED';
           budgetDropped.push(chunk.chunk_id);
           continue;
@@ -91,6 +98,8 @@ export class PromptAssembler {
       // The model reads the conversation in the order it happened, not in rank order.
       included.sort((a, b) => a.ts - b.ts);
     }
+
+    contextTokens += webTokens;
 
     const sections: string[] = [];
     if (input.history.length) {
@@ -110,6 +119,7 @@ export class PromptAssembler {
             : '(no relevant messages found)') +
           '\n</context>',
       );
+      if (webBlock) sections.push(webBlock);
     }
     for (const t of input.tool_results) {
       sections.push(`<tool_result name="${t.tool}">\n${neutralize(JSON.stringify(t.result))}\n</tool_result>`);
@@ -127,6 +137,7 @@ export class PromptAssembler {
       included_chunk_ids: included.map((c) => c.id),
       budget_dropped_chunk_ids: budgetDropped,
       truncated_chunk_ids: truncated,
+      web_result_count: input.kind === 'answer' ? input.web_results.length : 0,
       context_tokens: contextTokens,
       context_budget_tokens: input.context_budget_tokens,
       prompt_tokens_estimate: estimateTokens(system) + estimateTokens(prompt),
@@ -134,7 +145,17 @@ export class PromptAssembler {
   }
 }
 
+function formatWebResults(hits: WebSearchHit[]): string {
+  if (!hits.length) return '';
+  const lines = hits.map((h, i) => {
+    const title = neutralize(h.title) || h.url;
+    const snippet = neutralize(h.content);
+    return `[${i + 1}] ${title} (${h.url}): ${snippet}`;
+  });
+  return `<web_results>\n${lines.join('\n')}\n</web_results>`;
+}
+
 /** Removes our structural tags from untrusted text so a message cannot close <context> and inject its own. */
 export function neutralize(text: string): string {
-  return text.replace(/<\/?\s*(context|history|tool_result)\b[^>]*>/gi, '');
+  return text.replace(/<\/?\s*(context|history|tool_result|web_results)\b[^>]*>/gi, '');
 }

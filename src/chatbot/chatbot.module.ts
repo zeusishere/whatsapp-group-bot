@@ -15,6 +15,7 @@ import { PromptAssembler } from './services/prompt-assembler.service.js';
 import { HeuristicReranker, Reranker } from './services/reranker.js';
 import { RetrievalService } from './services/retrieval.service.js';
 import { ToolRegistry } from './services/tool.registry.js';
+import { WebSearchService } from './services/web-search.service.js';
 import { TraceRepository } from './tracing/trace.repository.js';
 import { TraceService } from './tracing/trace.service.js';
 
@@ -31,6 +32,7 @@ import { TraceService } from './tracing/trace.service.js';
     { provide: Reranker, useClass: HeuristicReranker },
     EmbeddingService,
     RetrievalService,
+    WebSearchService,
     ToolRegistry,
     DecisionEngine,
     PromptAssembler,

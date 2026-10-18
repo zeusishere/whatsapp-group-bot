@@ -71,6 +71,16 @@ describe('validateConfig', () => {
     expect(cfg.tracing.redact).toBe(false);
   });
 
+  it('accepts an empty webSearch.apiKey and merges overrides', () => {
+    const cfg = validateConfig({
+      auth,
+      webSearch: { apiKey: '', maxResults: 3 },
+    });
+    expect(cfg.webSearch.apiKey).toBe('');
+    expect(cfg.webSearch.maxResults).toBe(3);
+    expect(cfg.webSearch.timeoutMs).toBe(DEFAULT_CONFIG.webSearch.timeoutMs);
+  });
+
   it('rejects out-of-range bot and llm values', () => {
     expect(() => validateConfig({ auth, llm: { temperature: 9 } })).toThrow(/temperature/);
     expect(() => validateConfig({ auth, bot: { minSimilarity: 2 } })).toThrow(/minSimilarity/);

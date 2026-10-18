@@ -4,8 +4,9 @@ import { AppConfig } from '../../config/env.schema.js';
 import { ChatThread, Json, Message } from '../models/types.js';
 import { DecisionEngine, FallbackCode, TurnContext } from '../services/decision-engine.service.js';
 import { PromptAssembler } from '../services/prompt-assembler.service.js';
-import { modelConfig } from '../services/prompts.js';
+import { SearchSource, modelConfig } from '../services/prompts.js';
 import { RetrievalService } from '../services/retrieval.service.js';
+import { WebSearchHit, WebSearchOutcome, WebSearchService } from '../services/web-search.service.js';
 import { TraceCollector } from '../tracing/trace-collector.js';
 
 export interface PipelineInput {
@@ -18,6 +19,8 @@ export interface PipelineInput {
   now?: number;
 }
 
+type RetrievalPack = { log: ReturnType<TraceCollector['recordRetrieval']>; texts: Map<string, string>; senders: Map<string, string> };
+
 /**
  * Orchestrates one request -> reply cycle. Every branch is a traced span, so a developer can
  * reconstruct why a given reply was produced (or why the fallback was used) from the database
@@ -26,14 +29,17 @@ export interface PipelineInput {
 @Injectable()
 export class ChatPipelineService {
   private readonly bot: AppConfig['bot'];
+  private readonly tracing: AppConfig['tracing'];
 
   constructor(
     private readonly decisions: DecisionEngine,
     private readonly retrieval: RetrievalService,
     private readonly assembler: PromptAssembler,
+    private readonly web: WebSearchService,
     config: ConfigService<AppConfig, true>,
   ) {
     this.bot = config.get('bot', { infer: true });
+    this.tracing = config.get('tracing', { infer: true });
   }
 
   async execute(collector: TraceCollector, input: PipelineInput): Promise<void> {
@@ -69,21 +75,33 @@ export class ChatPipelineService {
       if (result !== null) toolResults.push({ tool: decision.tool, result });
     }
 
-    const needsContext = decision.route === 'answer_from_context' || decision.route === 'use_tool';
-    let retrievalPack: { log: ReturnType<TraceCollector['recordRetrieval']>; texts: Map<string, string>; senders: Map<string, string> } | null =
-      null;
+    const source = decision.search_source;
+    const wantsMessages = source === 'messages' || source === 'hybrid';
+    const wantsWeb = this.web.enabled && (source === 'web' || source === 'hybrid');
 
-    if (needsContext) {
-      retrievalPack = await this.retrieve(collector, input, rewritten, now);
-      const relevant = retrievalPack.log.retrieved_chunks.filter((c) => c.drop_reason === null);
-      if (!relevant.length) {
-        // Edge case 1: empty or all-below-threshold retrieval. Never generate from nothing.
-        const best = maxSimilarity(retrievalPack.log.retrieved_chunks);
+    let retrievalPack: RetrievalPack | null = null;
+    let webHits: WebSearchHit[] = [];
+
+    if (wantsMessages || wantsWeb) {
+      const webQuery = rewritten[0] || input.question;
+      const [messages, web] = await Promise.all([
+        wantsMessages ? this.retrieve(collector, input, rewritten, now) : Promise.resolve(null),
+        wantsWeb ? this.searchWeb(collector, webQuery) : Promise.resolve(null),
+      ]);
+      retrievalPack = messages;
+      webHits = web?.results ?? [];
+
+      const messageHits = retrievalPack?.log.retrieved_chunks.filter((c) => c.drop_reason === null).length ?? 0;
+      const hasEvidence = (wantsMessages && messageHits > 0) || (wantsWeb && webHits.length > 0);
+      if (!hasEvidence) {
+        const chunks = retrievalPack?.log.retrieved_chunks ?? [];
         await this.decisions.lowConfidenceContext(collector, {
-          candidates: retrievalPack.log.retrieved_chunks.length,
-          best_similarity: best,
+          candidates: chunks.length,
+          best_similarity: maxSimilarity(chunks),
           min_similarity: this.bot.minSimilarity,
-          drop_reasons: countDrops(retrievalPack.log.retrieved_chunks),
+          drop_reasons: countDrops(chunks),
+          search_source: source,
+          web_results: webHits.length,
         });
         await this.decisions.fallback(collector, 'LOW_CONFIDENCE_CONTEXT');
         return;
@@ -94,16 +112,19 @@ export class ChatPipelineService {
       'PROMPT_ASSEMBLY',
       {
         kind: decision.route === 'smalltalk' ? 'smalltalk' : 'answer',
+        search_source: source,
         context_budget_tokens: this.bot.contextTokenBudget,
         max_chunks: this.bot.retrievalTopK,
         history_messages: input.history.length,
         tool_results: toolResults.length,
+        web_results: webHits.length,
       },
       (span) => {
         const prompt = this.assembler.assemble({
           question: input.question,
           history: input.history,
           retrieval: retrievalPack,
+          web_results: webHits,
           tool_results: toolResults,
           kind: decision.route === 'smalltalk' ? 'smalltalk' : 'answer',
           context_budget_tokens: this.bot.contextTokenBudget,
@@ -115,14 +136,11 @@ export class ChatPipelineService {
           included_chunk_ids: prompt.included_chunk_ids,
           budget_dropped_chunk_ids: prompt.budget_dropped_chunk_ids,
           truncated_chunk_ids: prompt.truncated_chunk_ids,
+          web_result_count: prompt.web_result_count,
           context_tokens: prompt.context_tokens,
           prompt_tokens_estimate: prompt.prompt_tokens_estimate,
         });
-        span.setRationale(
-          prompt.budget_dropped_chunk_ids.length
-            ? `Admitted ${prompt.included_chunk_ids.length} chunk(s); dropped ${prompt.budget_dropped_chunk_ids.length} for the ${prompt.context_budget_tokens}-token budget.`
-            : `Assembled the ${prompt.template.id} v${prompt.template.version} prompt with ${prompt.included_chunk_ids.length} chunk(s).`,
-        );
+        span.setRationale(assemblyRationale(prompt, source));
         return prompt;
       },
     );
@@ -134,14 +152,14 @@ export class ChatPipelineService {
   /**
    * Runs hybrid retrieval as one CONTEXT_RETRIEVAL span and buffers the log (chunk fates are
    * finalized later by prompt assembly). A thread not bound to a group is treated as an empty
-   * retrieval so the low-confidence path still fires.
+   * retrieval so the low-confidence path still fires when messages were requested.
    */
   private async retrieve(
     collector: TraceCollector,
     input: PipelineInput,
     rewritten: string[],
     now: number,
-  ): Promise<{ log: ReturnType<TraceCollector['recordRetrieval']>; texts: Map<string, string>; senders: Map<string, string> }> {
+  ): Promise<RetrievalPack> {
     return collector.span(
       'CONTEXT_RETRIEVAL',
       {
@@ -199,6 +217,52 @@ export class ChatPipelineService {
       },
     );
   }
+
+  /**
+   * Tavily lookup as a WEB_SEARCH span. HTTP / timeout failures are recorded as ERROR and
+   * recovered as an empty result set so the turn can still answer from group messages.
+   */
+  private async searchWeb(collector: TraceCollector, query: string): Promise<WebSearchOutcome> {
+    try {
+      return await collector.span('WEB_SEARCH', { query, provider: 'tavily' }, async (span) => {
+        const outcome = await this.web.search(query);
+        const preview = this.tracing.previewChars;
+        span.setOutcome({
+          provider: 'tavily',
+          query: outcome.query,
+          result_count: outcome.results.length,
+          results: outcome.results.map((r) => ({
+            title: r.title,
+            url: r.url,
+            content_preview: r.content.slice(0, preview),
+            score: r.score,
+          })),
+          latency_ms: outcome.latency_ms,
+        });
+        span.setRationale(
+          outcome.results.length
+            ? `Tavily returned ${outcome.results.length} result(s).`
+            : 'Tavily returned no results.',
+        );
+        return outcome;
+      });
+    } catch {
+      return { query, results: [], latency_ms: 0 };
+    }
+  }
+}
+
+function assemblyRationale(
+  prompt: { included_chunk_ids: string[]; budget_dropped_chunk_ids: string[]; web_result_count: number; template: { id: string; version: string }; context_budget_tokens: number },
+  source: SearchSource,
+): string {
+  const parts = [`Assembled the ${prompt.template.id} v${prompt.template.version} prompt (search_source=${source})`];
+  parts.push(`${prompt.included_chunk_ids.length} chat chunk(s)`);
+  if (prompt.web_result_count) parts.push(`${prompt.web_result_count} web result(s)`);
+  if (prompt.budget_dropped_chunk_ids.length) {
+    parts.push(`dropped ${prompt.budget_dropped_chunk_ids.length} for the ${prompt.context_budget_tokens}-token budget`);
+  }
+  return `${parts[0]} with ${parts.slice(1).join('; ')}.`;
 }
 
 function countDrops(chunks: { drop_reason: string | null }[]): Record<string, number> {

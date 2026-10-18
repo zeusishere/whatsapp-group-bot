@@ -19,6 +19,7 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     llm: { ...DEFAULT_CONFIG.llm, apiKey: 'test-key', ...overrides.llm },
     bot: { ...DEFAULT_CONFIG.bot, ...overrides.bot },
     tracing: { ...DEFAULT_CONFIG.tracing, ...overrides.tracing },
+    webSearch: { ...DEFAULT_CONFIG.webSearch, ...overrides.webSearch },
     database: { ...DEFAULT_CONFIG.database, path: ':memory:', ...overrides.database },
   };
 }

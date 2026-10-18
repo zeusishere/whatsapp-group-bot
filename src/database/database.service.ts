@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import Database from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { TRACE_SCHEMA_SQL } from '../chatbot/models/trace.schema.js';
+import { MIGRATE_DECISION_SPANS_WEB_SEARCH_SQL, TRACE_SCHEMA_SQL } from '../chatbot/models/trace.schema.js';
 import { AppConfig } from '../config/env.schema.js';
 import { MIGRATE_MESSAGES_SQL, SCHEMA_SQL } from './schema.sql.js';
 
@@ -27,6 +27,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     this.migrate();
     this.db.exec(SCHEMA_SQL);
     this.db.exec(TRACE_SCHEMA_SQL);
+    this.migrateDecisionSpans();
     this.ensureRetrievalIndexes();
     this.logger.log(`SQLite ready at ${file} (journal_mode=${this.db.pragma('journal_mode', { simple: true })})`);
   }
@@ -69,6 +70,21 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     if (cols.length > 0 && !cols.some((c) => c.name === 'session_id')) {
       this.logger.log('Migrating messages table to multi-session layout');
       this.db.transaction(() => this.db.exec(MIGRATE_MESSAGES_SQL))();
+    }
+  }
+
+  /** Existing DBs were created with a CHECK that does not list WEB_SEARCH. */
+  private migrateDecisionSpans(): void {
+    const row = this.db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decision_spans'`).get() as
+      | { sql: string }
+      | undefined;
+    if (!row?.sql || row.sql.includes("'WEB_SEARCH'")) return;
+    this.logger.log('Migrating decision_spans to allow WEB_SEARCH');
+    this.db.pragma('foreign_keys = OFF');
+    try {
+      this.db.transaction(() => this.db.exec(MIGRATE_DECISION_SPANS_WEB_SEARCH_SQL))();
+    } finally {
+      this.db.pragma('foreign_keys = ON');
     }
   }
 }
