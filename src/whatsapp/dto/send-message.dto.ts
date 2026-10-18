@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
+import { IsArray, IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 export class SendMessageDto {
   @ApiProperty({ example: '120363000000000000@g.us', description: 'Group or user JID' })
@@ -17,4 +17,13 @@ export class SendMessageDto {
   @IsOptional()
   @IsString()
   quotedMessageId?: string;
+
+  @ApiPropertyOptional({
+    description: 'WhatsApp JIDs/LIDs mentioned in text (e.g. ["73684542824592@lid"])',
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  mentions?: string[];
 }

@@ -73,13 +73,13 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Existing DBs were created with a CHECK that does not list WEB_SEARCH. */
+  /** Existing DBs were created with a CHECK that does not list WEB_SEARCH / WEB_FETCH. */
   private migrateDecisionSpans(): void {
     const row = this.db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'decision_spans'`).get() as
       | { sql: string }
       | undefined;
-    if (!row?.sql || row.sql.includes("'WEB_SEARCH'")) return;
-    this.logger.log('Migrating decision_spans to allow WEB_SEARCH');
+    if (!row?.sql || (row.sql.includes("'WEB_SEARCH'") && row.sql.includes("'WEB_FETCH'"))) return;
+    this.logger.log('Migrating decision_spans to allow WEB_SEARCH and WEB_FETCH');
     this.db.pragma('foreign_keys = OFF');
     try {
       this.db.transaction(() => this.db.exec(MIGRATE_DECISION_SPANS_WEB_SEARCH_SQL))();

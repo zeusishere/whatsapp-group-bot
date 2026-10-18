@@ -11,7 +11,13 @@ import type pino from 'pino';
 import QRCode from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import { DatabaseService } from '../database/database.service.js';
-import { MessagesRepository, StoredMessage } from '../messages/messages.repository.js';
+import {
+  GroupMember,
+  jidHandle,
+  MessagesRepository,
+  normalizeJid,
+  StoredMessage,
+} from '../messages/messages.repository.js';
 import { SessionPatch, SessionsRepository } from '../sessions/sessions.repository.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { extractGroupMessage } from './message-extractor.js';
@@ -182,6 +188,48 @@ export class SessionRuntime {
     }));
   }
 
+  async getGroupMembers(groupId: string): Promise<GroupMember[]> {
+    const botJids = [this.botJid, this.botLid].filter((j): j is string => !!j);
+    const known = this.deps.messages.listGroupMembers(this.id, groupId, botJids);
+    if (!this.sock || this.state !== 'connected') return known;
+
+    try {
+      const meta = await this.sock.groupMetadata(groupId);
+      const excluded = new Set(botJids.flatMap((j) => [normalizeJid(j), jidHandle(j)]));
+      const byHandle = new Map<string, GroupMember>();
+      for (const m of known) {
+        byHandle.set(m.handle, m);
+      }
+      for (const p of meta.participants ?? []) {
+        const rawJid = p.id || p.lid || p.phoneNumber;
+        if (!rawJid) continue;
+        const jid = normalizeJid(rawJid);
+        const handle = jidHandle(jid);
+        if (!handle || excluded.has(jid) || excluded.has(handle)) continue;
+        const pLid = p.lid ? jidHandle(p.lid) : null;
+        const pPn = p.phoneNumber ? jidHandle(p.phoneNumber) : null;
+        if ((pLid && excluded.has(pLid)) || (pPn && excluded.has(pPn))) continue;
+
+        const existing =
+          byHandle.get(handle) ??
+          (pLid ? byHandle.get(pLid) : undefined) ??
+          (pPn ? byHandle.get(pPn) : undefined);
+        const metaName =
+          [p.name, p.notify, p.verifiedName]
+            .find((n) => typeof n === 'string' && n.trim().length > 0)
+            ?.trim() ?? null;
+        if (existing) {
+          if (!existing.name && metaName) existing.name = metaName;
+        } else {
+          byHandle.set(handle, { jid, handle, name: metaName });
+        }
+      }
+      return [...byHandle.values()];
+    } catch {
+      return known;
+    }
+  }
+
   async sendMessage(dto: SendMessageDto): Promise<{ id: string | null; jid: string }> {
     const sock = this.requireSocket();
 
@@ -202,7 +250,22 @@ export class SessionRuntime {
       };
     }
 
-    const sent = await sock.sendMessage(dto.jid, { text: dto.text }, quoted ? { quoted } : undefined);
+    const mentionSet = new Set<string>(dto.mentions ?? []);
+    if (dto.jid.endsWith('@g.us') && /@\d{5,20}\b/.test(dto.text)) {
+      const members = await this.getGroupMembers(dto.jid);
+      const byHandle = new Map(members.map((m) => [m.handle, m.jid]));
+      for (const match of dto.text.matchAll(/(?<![A-Za-z0-9._%+-])@(\d{5,20})\b/g)) {
+        const jid = byHandle.get(match[1]);
+        if (jid) mentionSet.add(jid);
+      }
+    }
+    const mentions = [...mentionSet];
+
+    const sent = await sock.sendMessage(
+      dto.jid,
+      { text: dto.text, ...(mentions.length ? { mentions } : {}) },
+      quoted ? { quoted } : undefined,
+    );
     if (sent) this.ingest(sent);
     return { id: sent?.key?.id ?? null, jid: dto.jid };
   }

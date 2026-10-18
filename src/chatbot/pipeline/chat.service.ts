@@ -17,6 +17,7 @@ import { SendMessageDto } from '../../whatsapp/dto/send-message.dto.js';
 import { WhatsappService } from '../../whatsapp/whatsapp.service.js';
 import { LlmClient } from '../llm/llm-client.js';
 import { ChatThread, ConversationTurn, TurnStatus } from '../models/types.js';
+import { resolveMentions } from '../services/mentions.js';
 import { TraceRepository } from '../tracing/trace.repository.js';
 import { TraceService } from '../tracing/trace.service.js';
 import { ChatPipelineService } from './chat-pipeline.service.js';
@@ -41,6 +42,8 @@ export interface ChatResult {
   /** True when the existing turn is still running (HTTP 202). */
   inProgress: boolean;
   botMessageId: string | null;
+  /** WhatsApp JIDs mentioned in the reply (when bound to a group). */
+  mentionedJids?: string[];
 }
 
 /**
@@ -119,10 +122,16 @@ export class ChatService implements OnModuleInit, OnApplicationBootstrap {
         idempotencyKey: `wa:${deviceSessionId}:${message.id}`,
         inboundExternalId: message.id,
         quotedMessageId: message.quotedMessageId,
+        inboundMentionedJids: message.mentionedJids,
       });
       if (!result.reply || result.inProgress || result.status === 'FAILED') return;
 
-      const dto: SendMessageDto = { jid: message.groupId, text: result.reply, quotedMessageId: message.id };
+      const dto: SendMessageDto = {
+        jid: message.groupId,
+        text: result.reply,
+        quotedMessageId: message.id,
+        ...(result.mentionedJids?.length ? { mentions: result.mentionedJids } : {}),
+      };
       const sent = await this.whatsapp.sendAsSession(deviceSessionId, dto);
       if (sent.id && result.botMessageId) this.repo.setMessageExternalId(result.botMessageId, sent.id);
     } catch (e) {
@@ -167,6 +176,7 @@ export class ChatService implements OnModuleInit, OnApplicationBootstrap {
       idempotencyKey: string;
       inboundExternalId: string | null;
       quotedMessageId: string | null;
+      inboundMentionedJids?: string[];
     },
   ): Promise<ChatResult> {
     const claim = this.trace.claim({
@@ -178,6 +188,12 @@ export class ChatService implements OnModuleInit, OnApplicationBootstrap {
 
     if (!claim.created) return toResult(claim.turn, false);
 
+    const rawMembers =
+      thread.device_session_id && thread.chat_jid && typeof this.whatsapp.getGroupMembers === 'function'
+        ? await this.whatsapp.getGroupMembers(thread.device_session_id, thread.chat_jid)
+        : undefined;
+    const members = this.pipeline.resolveThreadMembers(thread, rawMembers);
+
     const turn = await this.withThreadLock(thread.session_id, () =>
       claim.collector.run(async (collector) => {
         const history = this.repo.recentMessages(thread.session_id, claim.turn.turn_id, this.bot.recentHistoryTurns);
@@ -187,10 +203,20 @@ export class ChatService implements OnModuleInit, OnApplicationBootstrap {
           history,
           inbound_external_id: input.inboundExternalId,
           quoted_message_id: input.quotedMessageId,
+          members,
+          inbound_mentioned_jids: input.inboundMentionedJids ?? [],
         });
       }),
     );
-    return toResult(turn, true);
+    const mentionedJids = turn.bot_reply_raw
+      ? resolveMentions(
+          turn.bot_reply_raw,
+          input.question,
+          members,
+          input.inboundMentionedJids ?? [],
+        ).mentionedJids
+      : [];
+    return toResult(turn, true, mentionedJids);
   }
 
   /** Queues work behind every earlier turn of the same thread. */
@@ -206,7 +232,7 @@ export class ChatService implements OnModuleInit, OnApplicationBootstrap {
   }
 }
 
-function toResult(turn: ConversationTurn, created: boolean): ChatResult {
+function toResult(turn: ConversationTurn, created: boolean, mentionedJids: string[] = []): ChatResult {
   return {
     turnId: turn.turn_id,
     sessionId: turn.session_id,
@@ -215,6 +241,7 @@ function toResult(turn: ConversationTurn, created: boolean): ChatResult {
     created,
     inProgress: turn.status === 'IN_PROGRESS',
     botMessageId: turn.bot_message_id,
+    ...(mentionedJids.length ? { mentionedJids } : {}),
   };
 }
 

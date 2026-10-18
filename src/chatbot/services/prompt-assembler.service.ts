@@ -1,5 +1,7 @@
 import { Injectable } from '@nestjs/common';
+import { GroupMember } from '../../messages/messages.repository.js';
 import { Json, MessageRole, RetrievalLog } from '../models/types.js';
+import { annotateMentions, formatMembersBlock } from './mentions.js';
 import { ANSWER_SYSTEM, PROMPTS, PromptTemplate, SMALLTALK_SYSTEM } from './prompts.js';
 import { estimateTokens, truncateToTokens } from './text-utils.js';
 import { WebSearchHit } from './web-search.service.js';
@@ -11,6 +13,8 @@ export interface AssembleInput {
   retrieval: { log: RetrievalLog; texts: Map<string, string>; senders: Map<string, string> } | null;
   web_results: WebSearchHit[];
   tool_results: { tool: string; result: Json }[];
+  /** Known group members and their @handle IDs for resolving/producing WhatsApp mentions. */
+  members?: GroupMember[];
   /** `smalltalk` prompts carry no retrieved context. */
   kind: 'answer' | 'smalltalk';
   /** Token budget for retrieved context only. */
@@ -57,6 +61,8 @@ export class PromptAssembler {
     const truncated: string[] = [];
     let contextTokens = 0;
 
+    const members = input.members ?? [];
+    const membersBlock = formatMembersBlock(members, neutralize);
     const webBlock = input.kind === 'answer' ? formatWebResults(input.web_results) : '';
     const webTokens = webBlock ? estimateTokens(webBlock) : 0;
     const messageBudget = Math.max(1, input.context_budget_tokens - webTokens);
@@ -68,7 +74,7 @@ export class PromptAssembler {
         if (chunk.drop_reason !== null) continue; // already rejected by retrieval (threshold, duplicate, policy)
 
         const full = texts.get(chunk.chunk_id) ?? chunk.content_preview;
-        let text = neutralize(full);
+        let text = neutralize(annotateMentions(full, members));
         let cost = estimateTokens(text) + CHUNK_OVERHEAD_TOKENS;
 
         if (included.length >= input.max_chunks) {
@@ -103,6 +109,9 @@ export class PromptAssembler {
     contextTokens += webTokens;
 
     const sections: string[] = [];
+    if (membersBlock) {
+      sections.push(membersBlock);
+    }
     if (input.history.length) {
       sections.push(
         '<history>\n' +
@@ -125,7 +134,7 @@ export class PromptAssembler {
     for (const t of input.tool_results) {
       sections.push(`<tool_result name="${t.tool}">\n${neutralize(JSON.stringify(t.result))}\n</tool_result>`);
     }
-    sections.push(`Latest message:\n${neutralize(input.question)}`);
+    sections.push(`Latest message:\n${neutralize(annotateMentions(input.question, members))}`);
 
     const template = input.kind === 'answer' ? PROMPTS.answerWithContext : PROMPTS.smalltalk;
     const system = input.kind === 'answer' ? ANSWER_SYSTEM : SMALLTALK_SYSTEM;
@@ -197,7 +206,7 @@ function formatWebResults(hits: WebSearchHit[]): string {
   if (!hits.length) return '';
   const lines = hits.map((h, i) => {
     const title = neutralize(h.title) || h.url;
-    const snippet = neutralize(h.content);
+    const snippet = neutralize(h.extracted || h.content);
     return `[${i + 1}] ${title} (${h.url}): ${snippet}`;
   });
   return `<web_results>\n${lines.join('\n')}\n</web_results>`;
@@ -205,5 +214,5 @@ function formatWebResults(hits: WebSearchHit[]): string {
 
 /** Removes our structural tags from untrusted text so a message cannot close <context> and inject its own. */
 export function neutralize(text: string): string {
-  return text.replace(/<\/?\s*(context|history|tool_result|web_results)\b[^>]*>/gi, '');
+  return text.replace(/<\/?\s*(members|context|history|tool_result|web_results)\b[^>]*>/gi, '');
 }

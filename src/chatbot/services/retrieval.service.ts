@@ -148,7 +148,12 @@ export class RetrievalService {
         rrf: rrf.get(id) ?? 0,
         bm25: bm25Best.get(id) ?? null,
         cosine,
-        coverage: Math.max(0, ...termsPerQuery.map((terms) => lexicalCoverage(terms, message.text))),
+        coverage: Math.max(
+          0,
+          ...termsPerQuery.map((terms) =>
+            lexicalCoverage(terms, `${message.senderName ?? ''} ${message.senderId} ${message.text}`),
+          ),
+        ),
       });
     }
 

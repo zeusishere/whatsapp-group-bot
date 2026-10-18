@@ -1,8 +1,15 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { performance } from 'node:perf_hooks';
 import { AppConfig } from '../../config/env.schema.js';
+import { GroupMember, MessagesRepository } from '../../messages/messages.repository.js';
 import { ChatThread, Json, Message } from '../models/types.js';
 import { DecisionEngine, FallbackCode, TurnContext } from '../services/decision-engine.service.js';
+import {
+  expandMemberQueries,
+  isMentionOrMemberQuery,
+  resolveMentions,
+} from '../services/mentions.js';
 import { PromptAssembler } from '../services/prompt-assembler.service.js';
 import { SearchSource, modelConfig } from '../services/prompts.js';
 import { RetrievalService } from '../services/retrieval.service.js';
@@ -16,6 +23,10 @@ export interface PipelineInput {
   /** WhatsApp id of the inbound message, used to exclude it from retrieval. */
   inbound_external_id: string | null;
   quoted_message_id: string | null;
+  /** Known group members (with @handle IDs) for mention resolution. */
+  members?: GroupMember[];
+  /** JIDs mentioned in the inbound message, if any. */
+  inbound_mentioned_jids?: string[];
   now?: number;
 }
 
@@ -37,13 +48,23 @@ export class ChatPipelineService {
     private readonly assembler: PromptAssembler,
     private readonly web: WebSearchService,
     config: ConfigService<AppConfig, true>,
+    @Optional() private readonly messages?: MessagesRepository,
   ) {
     this.bot = config.get('bot', { infer: true });
     this.tracing = config.get('tracing', { infer: true });
   }
 
+  resolveThreadMembers(thread: ChatThread, provided?: GroupMember[]): GroupMember[] {
+    if (provided) return provided;
+    if (thread.device_session_id && thread.chat_jid && this.messages) {
+      return this.messages.listGroupMembers(thread.device_session_id, thread.chat_jid);
+    }
+    return [];
+  }
+
   async execute(collector: TraceCollector, input: PipelineInput): Promise<void> {
     const now = input.now ?? Date.now();
+    const members = this.resolveThreadMembers(input.thread, input.members);
     const ctx: TurnContext = {
       question: input.question,
       history: input.history,
@@ -84,15 +105,18 @@ export class ChatPipelineService {
 
     if (wantsMessages || wantsWeb) {
       const webQuery = rewritten[0] || input.question;
+      const messageQueries = expandMemberQueries(input.question, rewritten, members);
       const [messages, web] = await Promise.all([
-        wantsMessages ? this.retrieve(collector, input, rewritten, now) : Promise.resolve(null),
+        wantsMessages ? this.retrieve(collector, input, messageQueries, now) : Promise.resolve(null),
         wantsWeb ? this.searchWeb(collector, webQuery) : Promise.resolve(null),
       ]);
       retrievalPack = messages;
       webHits = web?.results ?? [];
 
       const messageHits = retrievalPack?.log.retrieved_chunks.filter((c) => c.drop_reason === null).length ?? 0;
-      const hasEvidence = (wantsMessages && messageHits > 0) || (wantsWeb && webHits.length > 0);
+      const hasEvidence =
+        (wantsMessages && (messageHits > 0 || isMentionOrMemberQuery(input.question, members))) ||
+        (wantsWeb && webHits.length > 0);
       if (!hasEvidence) {
         const chunks = retrievalPack?.log.retrieved_chunks ?? [];
         await this.decisions.lowConfidenceContext(collector, {
@@ -105,6 +129,10 @@ export class ChatPipelineService {
         });
         await this.decisions.fallback(collector, 'LOW_CONFIDENCE_CONTEXT');
         return;
+      }
+
+      if (this.web.extractTopN > 0 && webHits.length > 0) {
+        webHits = await this.fetchPages(collector, webHits);
       }
     }
 
@@ -126,6 +154,7 @@ export class ChatPipelineService {
           retrieval: retrievalPack,
           web_results: webHits,
           tool_results: toolResults,
+          members,
           kind: decision.route === 'smalltalk' ? 'smalltalk' : 'answer',
           context_budget_tokens: this.bot.contextTokenBudget,
           max_chunks: this.bot.retrievalTopK,
@@ -145,8 +174,14 @@ export class ChatPipelineService {
       },
     );
 
-    const reply = await this.decisions.generate(collector, assembled);
-    collector.setReply(reply);
+    const rawReply = await this.decisions.generate(collector, assembled);
+    const resolved = resolveMentions(
+      rawReply,
+      input.question,
+      members,
+      input.inbound_mentioned_jids ?? [],
+    );
+    collector.setReply(resolved.text);
   }
 
   /**
@@ -248,6 +283,37 @@ export class ChatPipelineService {
       });
     } catch {
       return { query, results: [], latency_ms: 0 };
+    }
+  }
+
+  private async fetchPages(collector: TraceCollector, hits: WebSearchHit[]): Promise<WebSearchHit[]> {
+    const urls = this.web.selectExtractUrls(hits.map((h) => h.url));
+    if (!urls.length) return hits;
+    try {
+      return await collector.span('WEB_FETCH', { urls, provider: 'tavily' }, async (span) => {
+        const t0 = performance.now();
+        const extracted = await this.web.extract(urls);
+        const latency_ms = Math.round(performance.now() - t0);
+        const pages = urls.map((url) => {
+          const text = extracted.get(url) ?? '';
+          return { url, chars: text.length, ok: text.length > 0 };
+        });
+        const succeeded = pages.filter((p) => p.ok).length;
+        span.setOutcome({
+          provider: 'tavily',
+          requested: urls.length,
+          succeeded,
+          pages,
+          latency_ms,
+        });
+        span.setRationale(`Tavily extracted ${succeeded} of ${urls.length} page(s).`);
+        return hits.map((h) => {
+          const text = extracted.get(h.url);
+          return text ? { ...h, extracted: text } : h;
+        });
+      });
+    } catch {
+      return hits;
     }
   }
 }

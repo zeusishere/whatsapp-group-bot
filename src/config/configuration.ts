@@ -206,6 +206,23 @@ export function validateConfig(raw: unknown): AppConfig {
       apiKey: pick(web, 'webSearch', 'apiKey', d.webSearch.apiKey, isApiKey, 'a string (empty disables web search)'),
       maxResults: pick(web, 'webSearch', 'maxResults', d.webSearch.maxResults, isPosInt, 'a positive integer'),
       timeoutMs: pick(web, 'webSearch', 'timeoutMs', d.webSearch.timeoutMs, isPosInt, 'a positive integer'),
+      extractTopN: pick(web, 'webSearch', 'extractTopN', d.webSearch.extractTopN, isNonNegInt, 'a non-negative integer'),
+      extractMaxChars: pick(
+        web,
+        'webSearch',
+        'extractMaxChars',
+        d.webSearch.extractMaxChars,
+        isPosInt,
+        'a positive integer',
+      ),
+      extractTimeoutMs: pick(
+        web,
+        'webSearch',
+        'extractTimeoutMs',
+        d.webSearch.extractTimeoutMs,
+        isPosInt,
+        'a positive integer',
+      ),
     },
   };
 

@@ -11,7 +11,11 @@ import { EmbeddingClient, LlmClient, LlmRequest, LlmResponse } from '../llm/llm-
 import { TraceRepository } from '../tracing/trace.repository.js';
 import { TraceService } from '../tracing/trace.service.js';
 
-export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+export type TestConfigOverrides = Omit<Partial<AppConfig>, 'webSearch'> & {
+  webSearch?: Partial<AppConfig['webSearch']>;
+};
+
+export function testConfig(overrides: TestConfigOverrides = {}): AppConfig {
   return {
     ...DEFAULT_CONFIG,
     ...overrides,
@@ -66,19 +70,21 @@ export function openTestDb(cfg: AppConfig = testConfig()): TestDb {
   const thread = repo.getOrCreateBoundThread(userId, deviceSessionId, groupId);
   const user: AuthUser = { id: userId, email: 'a@b.c', role: 'admin' };
 
-  const insertMessage = (m: Partial<StoredMessage> & { id: string; text: string }) => {
-    messages.insert(deviceSessionId, {
+  const insertMessage = (m: Partial<StoredMessage> & { id: string; text: string }): StoredMessage => {
+    const stored: StoredMessage = {
       id: m.id,
       groupId,
       senderId: m.senderId ?? '111@s.whatsapp.net',
-      senderName: m.senderName ?? 'Alice',
+      senderName: m.senderName === undefined ? 'Alice' : m.senderName,
       text: m.text,
       timestamp: m.timestamp ?? Date.now(),
       isBot: m.isBot ?? false,
       quotedMessageId: m.quotedMessageId ?? null,
       quotedParticipant: m.quotedParticipant ?? null,
       mentionedJids: m.mentionedJids ?? [],
-    });
+    };
+    messages.insert(deviceSessionId, stored);
+    return stored;
   };
 
   return { db, database, repo, messages, trace, user, thread, deviceSessionId, groupId, insertMessage };

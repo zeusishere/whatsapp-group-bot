@@ -22,6 +22,22 @@ export interface GroupSummary {
   lastTimestamp: number;
 }
 
+export interface GroupMember {
+  jid: string;
+  handle: string;
+  name: string | null;
+}
+
+export function jidHandle(jid: string): string {
+  return jid.split('@')[0]?.split(':')[0]?.trim() ?? '';
+}
+
+export function normalizeJid(jid: string): string {
+  const [userPart, domain] = jid.trim().split('@');
+  if (!userPart || !domain) return jid.trim();
+  return `${userPart.split(':')[0]}@${domain}`;
+}
+
 interface MessageRow {
   id: string;
   group_id: string;
@@ -158,6 +174,95 @@ export class MessagesRepository {
          FROM messages WHERE session_id = ? GROUP BY group_id ORDER BY lastTimestamp DESC`,
       )
       .all(sessionId) as GroupSummary[];
+  }
+
+  listGroupMembers(sessionId: string, groupId: string, excludeJids: string[] = []): GroupMember[] {
+    const db = this.database.connection;
+    const sessionRow = db
+      .prepare('SELECT jid, lid FROM sessions WHERE id = ?')
+      .get(sessionId) as { jid: string | null; lid: string | null } | undefined;
+    const botRows = db
+      .prepare('SELECT DISTINCT sender_id FROM messages WHERE session_id = ? AND is_bot = 1')
+      .all(sessionId) as Array<{ sender_id: string }>;
+
+    const excluded = new Set<string>();
+    for (const raw of [
+      ...excludeJids,
+      sessionRow?.jid ?? '',
+      sessionRow?.lid ?? '',
+      ...botRows.map((r) => r.sender_id),
+    ]) {
+      if (!raw) continue;
+      const norm = normalizeJid(raw);
+      const handle = jidHandle(norm);
+      if (norm) excluded.add(norm);
+      if (handle) excluded.add(handle);
+    }
+
+    const nameByHandle = new Map<string, string>();
+    const nameRows = db
+      .prepare(
+        `SELECT sender_id, sender_name FROM messages
+         WHERE session_id = ? AND is_bot = 0 AND sender_name IS NOT NULL AND trim(sender_name) != ''
+         ORDER BY timestamp DESC, rowid DESC`,
+      )
+      .all(sessionId) as Array<{ sender_id: string; sender_name: string }>;
+    for (const r of nameRows) {
+      const handle = jidHandle(r.sender_id);
+      if (handle && !nameByHandle.has(handle)) {
+        nameByHandle.set(handle, r.sender_name.trim());
+      }
+    }
+
+    const byHandle = new Map<string, GroupMember>();
+    const addCandidate = (rawJid: string, rawName?: string | null) => {
+      if (!rawJid || rawJid.endsWith('@g.us')) return;
+      const jid = normalizeJid(rawJid);
+      const handle = jidHandle(jid);
+      if (!handle || !jid.includes('@') || excluded.has(jid) || excluded.has(handle)) return;
+      const candidateName = rawName?.trim() || nameByHandle.get(handle) || null;
+      const existing = byHandle.get(handle);
+      if (!existing) {
+        byHandle.set(handle, { jid, handle, name: candidateName });
+      } else if (!existing.name && candidateName) {
+        existing.name = candidateName;
+      }
+    };
+
+    const groupRows = db
+      .prepare(
+        `SELECT sender_id, sender_name, is_bot, mentioned_jids FROM messages
+         WHERE session_id = ? AND group_id = ?
+         ORDER BY timestamp DESC, rowid DESC`,
+      )
+      .all(sessionId, groupId) as Array<{
+      sender_id: string;
+      sender_name: string | null;
+      is_bot: number;
+      mentioned_jids: string;
+    }>;
+
+    for (const row of groupRows) {
+      if (!row.is_bot) {
+        addCandidate(row.sender_id, row.sender_name);
+      }
+      if (row.mentioned_jids) {
+        try {
+          const parsed = JSON.parse(row.mentioned_jids) as unknown;
+          if (Array.isArray(parsed)) {
+            for (const m of parsed) {
+              if (typeof m === 'string' && nameByHandle.has(jidHandle(m))) {
+                addCandidate(m);
+              }
+            }
+          }
+        } catch {
+          // ignore malformed mentioned_jids
+        }
+      }
+    }
+
+    return [...byHandle.values()];
   }
 
   deleteBySession(sessionId: string): number {

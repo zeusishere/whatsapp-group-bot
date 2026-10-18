@@ -74,11 +74,14 @@ describe('validateConfig', () => {
   it('accepts an empty webSearch.apiKey and merges overrides', () => {
     const cfg = validateConfig({
       auth,
-      webSearch: { apiKey: '', maxResults: 3 },
+      webSearch: { apiKey: '', maxResults: 3, extractTopN: 0 },
     });
     expect(cfg.webSearch.apiKey).toBe('');
     expect(cfg.webSearch.maxResults).toBe(3);
     expect(cfg.webSearch.timeoutMs).toBe(DEFAULT_CONFIG.webSearch.timeoutMs);
+    expect(cfg.webSearch.extractTopN).toBe(0);
+    expect(cfg.webSearch.extractMaxChars).toBe(DEFAULT_CONFIG.webSearch.extractMaxChars);
+    expect(cfg.webSearch.extractTimeoutMs).toBe(DEFAULT_CONFIG.webSearch.extractTimeoutMs);
   });
 
   it('rejects out-of-range bot and llm values', () => {

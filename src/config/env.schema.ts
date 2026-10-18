@@ -65,6 +65,9 @@ export interface AppConfig {
     apiKey: string;
     maxResults: number;
     timeoutMs: number;
+    extractTopN: number;
+    extractMaxChars: number;
+    extractTimeoutMs: number;
   };
 }
 
@@ -105,5 +108,12 @@ export const DEFAULT_CONFIG: AppConfig = {
       "I couldn't find enough relevant context in this chat to answer that reliably. Could you rephrase or add more detail?",
   },
   tracing: { redact: true, previewChars: 240, maxFieldChars: 4000 },
-  webSearch: { apiKey: '', maxResults: 5, timeoutMs: 10_000 },
+  webSearch: {
+    apiKey: '',
+    maxResults: 5,
+    timeoutMs: 10_000,
+    extractTopN: 3,
+    extractMaxChars: 4000,
+    extractTimeoutMs: 15_000,
+  },
 };

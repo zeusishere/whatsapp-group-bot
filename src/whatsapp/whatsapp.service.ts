@@ -11,7 +11,7 @@ import pino from 'pino';
 import { AuthUser } from '../auth/auth.types.js';
 import { AppConfig } from '../config/env.schema.js';
 import { DatabaseService } from '../database/database.service.js';
-import { MessagesRepository, StoredMessage } from '../messages/messages.repository.js';
+import { GroupMember, MessagesRepository, StoredMessage } from '../messages/messages.repository.js';
 import { SessionRecord, SessionsRepository } from '../sessions/sessions.repository.js';
 import { SendMessageDto } from './dto/send-message.dto.js';
 import { RuntimeDeps, SessionRuntime } from './session-runtime.js';
@@ -215,6 +215,20 @@ export class WhatsappService implements OnModuleInit, OnApplicationBootstrap, On
       throw new ConflictException(`Session is not connected (state: ${runtime?.snapshot().state ?? rec.status})`);
     }
     return runtime.sendMessage(dto);
+  }
+
+  /**
+   * Lists known participants in a group for a device session, combining stored message senders
+   * with live Baileys groupMetadata when connected.
+   */
+  async getGroupMembers(sessionId: string, groupId: string): Promise<GroupMember[]> {
+    const runtime = this.runtimes.get(sessionId);
+    if (runtime) {
+      return runtime.getGroupMembers(groupId);
+    }
+    const rec = this.sessions.findById(sessionId);
+    const botJids = [rec?.jid, rec?.lid].filter((j): j is string => !!j);
+    return this.messages.listGroupMembers(sessionId, groupId, botJids);
   }
 
   // ------------------------------------------------------------------ internals

@@ -21,7 +21,7 @@ function build(opts?: { llm?: StubLlm; cfg?: ReturnType<typeof testConfig> }) {
   const decisions = new DecisionEngine(llm, tools, configService(cfg));
   const assembler = new PromptAssembler();
   const web = new WebSearchService(configService(cfg));
-  const pipeline = new ChatPipelineService(decisions, retrieval, assembler, web, configService(cfg));
+  const pipeline = new ChatPipelineService(decisions, retrieval, assembler, web, configService(cfg), h.messages);
   const inspector = new TraceInspectorService(h.repo);
   return { ...h, llm, pipeline, inspector, cfg };
 }
@@ -228,19 +228,41 @@ describe('ChatPipelineService', () => {
       globalThis.fetch = originalFetch;
     });
 
-    function mockTavily(results: { title: string; url: string; content: string; score: number }[]) {
-      globalThis.fetch = (async () => ({
-        ok: true,
-        json: async () => ({ results }),
-        text: async () => '',
-      })) as unknown as typeof fetch;
+    function mockTavily(
+      results: { title: string; url: string; content: string; score: number }[],
+      extract?: Record<string, string> | 'fail',
+    ) {
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith('/extract')) {
+          if (extract === 'fail') {
+            return { ok: false, status: 502, json: async () => ({}), text: async () => 'bad gateway' };
+          }
+          const map = extract ?? {};
+          return {
+            ok: true,
+            json: async () => ({
+              results: Object.entries(map).map(([u, raw_content]) => ({ url: u, raw_content })),
+            }),
+            text: async () => '',
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({ results }),
+          text: async () => '',
+        };
+      }) as unknown as typeof fetch;
     }
 
     const webCfg = () => testConfig({ webSearch: { apiKey: 'tvly-test', maxResults: 5, timeoutMs: 10000 } });
 
-    it('web-only skips message retrieval and answers from Tavily', async () => {
+    it('web-only skips message retrieval, extracts page text, and answers from Tavily', async () => {
       const h = build({ cfg: webCfg() });
-      mockTavily([{ title: 'Launch', url: 'https://example.com/launch', content: 'The launch is Tuesday.', score: 0.9 }]);
+      mockTavily(
+        [{ title: 'Launch', url: 'https://example.com/launch', content: 'The launch is Tuesday.', score: 0.9 }],
+        { 'https://example.com/launch': 'Detailed page body: The product launch is Tuesday at 10am UTC.' },
+      );
       scripted(h.llm, {
         route: { route: 'answer_from_context', search_source: 'web', confidence: 0.9, rationale: 'public fact' },
         answer: 'Tuesday, according to the web.',
@@ -265,10 +287,54 @@ describe('ChatPipelineService', () => {
 
       expect(turn.status).toBe('COMPLETED');
       expect(turn.bot_reply_raw).toBe('Tuesday, according to the web.\n\nSources:\n[1] Launch - https://example.com/launch');
-      const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
+      const spans = h.repo.getSpans(turn.turn_id);
+      const types = spans.map((s) => s.step_type);
       expect(types).toContain('WEB_SEARCH');
+      expect(types).toContain('WEB_FETCH');
+      expect(types.indexOf('WEB_SEARCH')).toBeLessThan(types.indexOf('WEB_FETCH'));
+      expect(types.indexOf('WEB_FETCH')).toBeLessThan(types.indexOf('PROMPT_ASSEMBLY'));
       expect(types).not.toContain('CONTEXT_RETRIEVAL');
       expect(types).toContain('LLM_GENERATION');
+      const genCall = h.llm.calls.find((c) => !c.json);
+      expect(genCall?.prompt).toContain('Detailed page body: The product launch is Tuesday at 10am UTC.');
+      expect(genCall?.prompt).not.toContain('The launch is Tuesday.');
+    });
+
+    it('degrades to search snippets when Tavily extract fails without failing the turn', async () => {
+      const h = build({ cfg: webCfg() });
+      mockTavily(
+        [{ title: 'Launch', url: 'https://example.com/launch', content: 'Snippet: launch is Tuesday.', score: 0.9 }],
+        'fail',
+      );
+      scripted(h.llm, {
+        route: { route: 'answer_from_context', search_source: 'web', confidence: 0.9, rationale: 'public fact' },
+        answer: 'Tuesday from snippet.',
+      });
+
+      const claim = h.trace.claim({
+        session_id: h.thread.session_id,
+        idempotency_key: 'web-extract-fail',
+        user_input_raw: 'when is the product launching?',
+        user_external_id: null,
+      });
+      if (!claim.created) throw new Error('expected create');
+      const turn = await claim.collector.run((c) =>
+        h.pipeline.execute(c, {
+          thread: h.thread,
+          question: 'when is the product launching?',
+          history: [],
+          inbound_external_id: null,
+          quoted_message_id: null,
+        }),
+      );
+
+      expect(turn.status).toBe('COMPLETED');
+      expect(turn.bot_reply_raw).toBe('Tuesday from snippet.\n\nSources:\n[1] Launch - https://example.com/launch');
+      const spans = h.repo.getSpans(turn.turn_id);
+      const fetchSpan = spans.find((s) => s.step_type === 'WEB_FETCH');
+      expect(fetchSpan?.status).toBe('ERROR');
+      const genCall = h.llm.calls.find((c) => !c.json);
+      expect(genCall?.prompt).toContain('Snippet: launch is Tuesday.');
     });
 
     it('hybrid generates when chat retrieval is empty but the web hits', async () => {
@@ -332,6 +398,61 @@ describe('ChatPipelineService', () => {
       const types = h.repo.getSpans(turn.turn_id).map((s) => s.step_type);
       expect(types).toContain('LOW_CONFIDENCE_CONTEXT');
       expect(types).not.toContain('LLM_GENERATION');
+    });
+  });
+
+  it('ChatService.handleMention resolves member @mentions and passes mentions JIDs to WhatsApp', async () => {
+    const h = build();
+    h.insertMessage({
+      id: 'm-vinay',
+      senderId: '73684542824592@lid',
+      senderName: 'Vinay Jampana',
+      text: 'I will be late',
+      timestamp: 1_000,
+    });
+    scripted(h.llm, {
+      route: { route: 'smalltalk', search_source: 'none', confidence: 0.95, rationale: 'ping request' },
+      answer: 'Hey Vinay, where are you right now?',
+    });
+
+    const sentDtos: unknown[] = [];
+    const whatsapp = {
+      setMentionHandler: () => undefined,
+      sendAsSession: async (_sid: string, dto: unknown) => {
+        sentDtos.push(dto);
+        return { id: 'wa-out-1', jid: h.groupId };
+      },
+    };
+    const sessions = {
+      findById: () => ({ ownerId: h.user.id }),
+      requireAccessible: () => ({ id: h.deviceSessionId }),
+    };
+    const chat = new ChatService(
+      h.llm,
+      h.trace,
+      h.repo,
+      h.pipeline,
+      sessions as never,
+      whatsapp as never,
+      configService(h.cfg),
+    );
+
+    const inbound = h.insertMessage({
+      id: 'm-in',
+      senderId: '269341845127193@lid',
+      senderName: 'Shubham',
+      text: '@239071553126652 tag vinay and ask him where he is?',
+      mentionedJids: ['239071553126652@lid'],
+      timestamp: 2_000,
+    });
+    await chat.handleMention(h.deviceSessionId, inbound);
+
+    expect(sentDtos).toHaveLength(1);
+    expect(sentDtos[0]).toEqual({
+      jid: h.groupId,
+      text: 'Hey @73684542824592, where are you right now?',
+      quotedMessageId: 'm-in',
+      mentions: ['73684542824592@lid'],
     });
   });
 });

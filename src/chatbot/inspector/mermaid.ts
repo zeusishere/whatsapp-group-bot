@@ -58,11 +58,14 @@ export function generateMermaidTrace(input: MermaidInput): string {
 
   const retrievalSpan = spans.find((s) => s.step_type === 'CONTEXT_RETRIEVAL');
   const webSpan = spans.find((s) => s.step_type === 'WEB_SEARCH');
+  const webFetchSpan = spans.find((s) => s.step_type === 'WEB_FETCH');
   const assembly = spans.find((s) => s.step_type === 'PROMPT_ASSEMBLY');
   if (retrievalSpan && assembly) {
     lines.push(`  ${spanNode(retrievalSpan)} -.-> ${spanNode(assembly)}`);
   }
-  if (webSpan && assembly) {
+  if (webFetchSpan && assembly) {
+    lines.push(`  ${spanNode(webFetchSpan)} -.-> ${spanNode(assembly)}`);
+  } else if (webSpan && assembly) {
     lines.push(`  ${spanNode(webSpan)} -.-> ${spanNode(assembly)}`);
   }
 

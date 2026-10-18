@@ -67,6 +67,29 @@ describe('PromptAssembler', () => {
     expect(prompt.prompt).toContain('Until 10pm');
     expect(prompt.web_result_count).toBe(1);
   });
+
+  it('prefers extracted page text over the short search snippet', () => {
+    const prompt = assembler.assemble({
+      question: 'menu?',
+      history: [],
+      retrieval: null,
+      web_results: [
+        {
+          title: 'Bistro',
+          url: 'https://bistro.example',
+          content: 'Short snippet.',
+          extracted: 'Full extracted page with pasta and pizza prices.',
+          score: 0.9,
+        },
+      ],
+      tool_results: [],
+      kind: 'answer',
+      context_budget_tokens: 1500,
+      max_chunks: 8,
+    });
+    expect(prompt.prompt).toContain('Full extracted page with pasta and pizza prices.');
+    expect(prompt.prompt).not.toContain('Short snippet.');
+  });
 });
 
 describe('neutralize', () => {

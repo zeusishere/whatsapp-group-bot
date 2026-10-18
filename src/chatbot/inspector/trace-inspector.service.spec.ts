@@ -55,12 +55,15 @@ describe('TraceInspectorService + generateMermaidTrace', () => {
           latency_ms: 4,
         });
       });
+      await c.span('WEB_SEARCH', { query: 'hello' }, () => undefined);
+      await c.span('WEB_FETCH', { urls: ['https://example.com'] }, () => undefined);
       await c.span('PROMPT_ASSEMBLY', {}, () => undefined);
       c.setReply('Hello there');
     });
 
     const view = inspector.inspectTurn(turn.turn_id, h.user);
-    expect(view.tree).toHaveLength(4); // guardrail(+child), rewrite, retrieval, assembly
+    expect(view.tree).toHaveLength(6); // guardrail(+child), rewrite, retrieval, web_search, web_fetch, assembly
+    expect(view.timeline.find((t) => t.step_type === 'WEB_FETCH')?.stage).toBe('Context Retrieval');
     expect(view.dag.nodes.some((n) => n.kind === 'user_message')).toBe(true);
     expect(view.dag.nodes.some((n) => n.kind === 'bot_message')).toBe(true);
     expect(view.dag.edges.some((e) => e.kind === 'parent')).toBe(true);
