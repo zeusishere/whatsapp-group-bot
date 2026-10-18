@@ -196,10 +196,12 @@ export class SessionRuntime {
     try {
       const meta = await this.sock.groupMetadata(groupId);
       const excluded = new Set(botJids.flatMap((j) => [normalizeJid(j), jidHandle(j)]));
-      const byHandle = new Map<string, GroupMember>();
+      const knownByHandle = new Map<string, GroupMember>();
       for (const m of known) {
-        byHandle.set(m.handle, m);
+        knownByHandle.set(m.handle, m);
       }
+
+      const activeByHandle = new Map<string, GroupMember>();
       for (const p of meta.participants ?? []) {
         const rawJid = p.id || p.lid || p.phoneNumber;
         if (!rawJid) continue;
@@ -210,21 +212,24 @@ export class SessionRuntime {
         const pPn = p.phoneNumber ? jidHandle(p.phoneNumber) : null;
         if ((pLid && excluded.has(pLid)) || (pPn && excluded.has(pPn))) continue;
 
-        const existing =
-          byHandle.get(handle) ??
-          (pLid ? byHandle.get(pLid) : undefined) ??
-          (pPn ? byHandle.get(pPn) : undefined);
+        const knownMatch =
+          knownByHandle.get(handle) ??
+          (pLid ? knownByHandle.get(pLid) : undefined) ??
+          (pPn ? knownByHandle.get(pPn) : undefined);
         const metaName =
           [p.name, p.notify, p.verifiedName]
             .find((n) => typeof n === 'string' && n.trim().length > 0)
             ?.trim() ?? null;
-        if (existing) {
-          if (!existing.name && metaName) existing.name = metaName;
-        } else {
-          byHandle.set(handle, { jid, handle, name: metaName });
-        }
+        const resolvedName = knownMatch?.name ?? metaName;
+        const resolvedJid = knownMatch?.jid ?? jid;
+        const resolvedHandle = knownMatch?.handle ?? handle;
+        activeByHandle.set(resolvedHandle, {
+          jid: resolvedJid,
+          handle: resolvedHandle,
+          name: resolvedName,
+        });
       }
-      return [...byHandle.values()];
+      return [...activeByHandle.values()];
     } catch {
       return known;
     }
@@ -324,7 +329,7 @@ export class SessionRuntime {
       logger: this.deps.baileysLogger.child({ sessionId: this.id }),
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
-      syncFullHistory: false,
+      syncFullHistory: true,
     });
     this.sock = sock;
 
@@ -369,19 +374,25 @@ export class SessionRuntime {
       }
     });
 
-    sock.ev.on('messages.upsert', ({ messages }) => {
+    sock.ev.on('messaging-history.set', ({ messages }) => {
       if (!isCurrent()) return;
-      for (const m of messages) this.ingest(m);
+      for (const m of messages) this.ingest(m, false);
+    });
+
+    sock.ev.on('messages.upsert', ({ messages, type }) => {
+      if (!isCurrent()) return;
+      const allowMentionReply = type === 'notify';
+      for (const m of messages) this.ingest(m, allowMentionReply);
     });
   }
 
-  private ingest(msg: WAMessage): void {
+  private ingest(msg: WAMessage, allowMentionReply = false): void {
     try {
       const stored = extractGroupMessage(msg, this.botJid);
       if (!stored) return;
       this.deps.messages.insert(this.id, stored);
-      // Bot-authored messages never trigger a turn; mentions of this device do.
-      if (!stored.isBot && this.mentionsBot(stored)) {
+      // Bot-authored and historical/append messages never trigger a turn; live mentions of this device do.
+      if (allowMentionReply && !stored.isBot && this.mentionsBot(stored)) {
         try {
           this.deps.onMention?.(this.id, stored);
         } catch (e) {
