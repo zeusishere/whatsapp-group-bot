@@ -136,10 +136,11 @@ export class ChatPipelineService {
       }
     }
 
+    const promptKind = decision.route === 'smalltalk' || decision.route === 'clarify' ? 'smalltalk' : 'answer';
     const assembled = await collector.span(
       'PROMPT_ASSEMBLY',
       {
-        kind: decision.route === 'smalltalk' ? 'smalltalk' : 'answer',
+        kind: promptKind,
         search_source: source,
         context_budget_tokens: this.bot.contextTokenBudget,
         max_chunks: this.bot.retrievalTopK,
@@ -155,7 +156,7 @@ export class ChatPipelineService {
           web_results: webHits,
           tool_results: toolResults,
           members,
-          kind: decision.route === 'smalltalk' ? 'smalltalk' : 'answer',
+          kind: promptKind,
           context_budget_tokens: this.bot.contextTokenBudget,
           max_chunks: this.bot.retrievalTopK,
         });

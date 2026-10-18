@@ -437,7 +437,7 @@ export function heuristicRoute(question: string, quotedMessageId: string | null)
 }
 
 function coerceSearchSource(route: Route, raw: unknown): SearchSource {
-  if (route === 'smalltalk' || route === 'out_of_scope') return 'none';
+  if (route === 'smalltalk' || route === 'clarify' || route === 'out_of_scope') return 'none';
   const source = typeof raw === 'string' && (SEARCH_SOURCES as readonly string[]).includes(raw) ? (raw as SearchSource) : 'messages';
   if (route === 'answer_from_context' && source === 'none') return 'messages';
   return source;

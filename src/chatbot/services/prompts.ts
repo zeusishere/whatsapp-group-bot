@@ -45,7 +45,7 @@ export const QUERY_REWRITE_SCHEMA = {
   required: ['queries'],
 };
 
-export const ROUTES = ['answer_from_context', 'use_tool', 'smalltalk', 'out_of_scope'] as const;
+export const ROUTES = ['answer_from_context', 'use_tool', 'smalltalk', 'clarify', 'out_of_scope'] as const;
 export type Route = (typeof ROUTES)[number];
 
 export const SEARCH_SOURCES = ['messages', 'web', 'hybrid', 'none'] as const;
@@ -71,6 +71,7 @@ export function intentRouterSystem(tools: { name: string; description: string; p
     '- answer_from_context: the user wants information. Retrieval will happen according to search_source.',
     '- use_tool: one of the tools below is required; set "tool" and "args". You may still set search_source.',
     '- smalltalk: a greeting, thanks, or casual remark that needs no information.',
+    '- clarify: the request is too vague or ambiguous to answer without asking a clarifying question first.',
     '- out_of_scope: harmful, abusive, or disallowed requests — not questions about the outside world.',
     'Pick search_source (this decides whether Tavily or the chat corpus runs):',
     '- web: public, current, or local information that would not live in this group\'s history. Includes news, weather, sports scores, opening hours, restaurants, pubs, concerts, "what\'s happening", events, "nearby", "this weekend", traffic, prices, and general knowledge.',

@@ -177,6 +177,7 @@ file. The file is validated at startup and the app refuses to boot on invalid va
 | POST | `/api/sessions/:id/send` | Send text: `{ "jid", "text", "quotedMessageId?" }` |
 | GET | `/api/sessions/:id/messages` | Stored messages, newest first. Query: `groupId`, `limit` (1-500), `before` (epoch ms) |
 | GET | `/api/sessions/:id/messages/groups` | Groups with stored messages and counts |
+| POST | `/api/sessions/:id/messages/import` | Import historical group messages from a WhatsApp `.txt` chat export or JSON array (`{ groupId, exportText?, messages? }`) |
 | POST | `/api/chat` | Run a turn. Body: `{ sessionId? }` or `{ deviceSessionId, groupId }` plus `message`. Optional `Idempotency-Key` header (202 if the turn is still running) |
 | GET | `/api/debug/traces/:turnId` | Execution DAG, timeline, retrievals, messages, Mermaid. `?format=mermaid` for `text/plain` |
 | GET | `/api/debug/messages/:messageId/trace` | Same view, looked up from a user or assistant message |
@@ -221,12 +222,29 @@ env.example.json          config template
 | --- | --- |
 | `pnpm start:dev` | Run with file watching |
 | `pnpm build` / `pnpm start:prod` | Compile and run `dist/` |
-| `pnpm test` | Unit tests |
+| `pnpm test` | Unit & evaluation tests |
+| `pnpm eval` | Run the 23-case anti-hallucination evaluation harness (`-- --live` to run against live Gemini/Tavily keys) |
 | `pnpm lint` | ESLint |
+
+## Anti-Hallucination Evaluation Harness
+
+`src/chatbot/eval/` contains a 23-case evaluation dataset (`eval-dataset.ts`) and runner (`eval-runner.ts`) that
+seeds an in-memory SQLite + FTS5 + vector corpus and runs every prompt through the full `ChatPipelineService`:
+
+- **`group_context` (7 cases):** single-message and multi-message synthesis over group history, including messages from former/deleted members imported via `.txt` exports.
+- **`web_browsing` (5 cases):** public/live web queries via Tavily (`search_source: 'web'`), verifying inline `[n]` markers, `Sources:` URLs, and abstention when web search returns no hits.
+- **`hybrid` (3 cases):** queries that combine a group chat entity (e.g., Priya's dinner venue or Shubham's AWS region) with live web facts (`search_source: 'hybrid'`).
+- **`unanswerable_abstention` (4 cases):** questions about topics never discussed in the group or dropped by `POLICY_FILTERED` (secrets), verifying `LOW_CONFIDENCE_CONTEXT` + `FALLBACK_TRIGGERED` instead of hallucination.
+- **`refusal_or_clarify` (4 cases):** ambiguous prompts (`route: 'clarify'`), harmful requests (`route: 'out_of_scope'`), and guardrail rejections (`GUARDRAIL_CHECK`).
+
+```bash
+pnpm eval            # deterministic offline run (exits non-zero on any failure)
+pnpm eval -- --live  # run against live Gemini + Tavily configured in env.json
+```
 
 ## Roadmap
 
 1. **Foundation:** project setup, Baileys connection API, multi-device sessions, JWT, message storage.
-2. **Traced bot (this step):** mention replies, hybrid retrieval, Gemini generation, turn/span/retrieval audit, debug API.
-3. Cross-encoder reranker, typing presence and outbound rate limiting.
-4. Offline evaluation harness.
+2. **Traced bot:** mention replies, hybrid retrieval, Gemini generation, turn/span/retrieval audit, debug API.
+3. **Evaluation harness:** 23-case anti-hallucination benchmark across group context, web browsing, hybrid, abstention, and guardrails.
+4. Cross-encoder reranker, typing presence and outbound rate limiting.

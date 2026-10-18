@@ -15,7 +15,8 @@
     "start:prod": "node dist/main",
     "format": "prettier --write \"src/**/*.ts\"",
     "lint": "eslint \"src/**/*.ts\"",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "eval": "nest build && node dist/chatbot/eval/run-eval.js"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
