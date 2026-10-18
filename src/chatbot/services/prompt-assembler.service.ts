@@ -65,7 +65,14 @@ export class PromptAssembler {
     const membersBlock = formatMembersBlock(members, neutralize);
     const webBlock = input.kind === 'answer' ? formatWebResults(input.web_results) : '';
     const webTokens = webBlock ? estimateTokens(webBlock) : 0;
-    const messageBudget = Math.max(1, input.context_budget_tokens - webTokens);
+    const hasKeptMessages =
+      input.kind === 'answer' &&
+      (input.retrieval?.log.retrieved_chunks.some((c) => c.drop_reason === null) ?? false);
+    const minMessageReserve =
+      hasKeptMessages && webTokens > 0
+        ? Math.min(400, Math.max(1, Math.floor(input.context_budget_tokens * 0.4)))
+        : 1;
+    const messageBudget = Math.max(minMessageReserve, input.context_budget_tokens - webTokens);
 
     if (input.kind === 'answer' && input.retrieval) {
       const { log, texts, senders } = input.retrieval;

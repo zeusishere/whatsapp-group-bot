@@ -178,7 +178,14 @@ export class RetrievalService {
     const chunks: RetrievedChunk[] = candidates.map((c) => {
       const text = c.message.text;
       const similarity = c.cosine ?? c.coverage;
-      const threshold = c.cosine !== null ? this.cfg.minSimilarity : this.cfg.minLexicalCoverage;
+      // Dense embedding models (e.g. gemini-embedding-001) yield ~0.60–0.68 baseline cosine
+      // between unrelated sentences; require a stricter cosine bar when lexical coverage is weak.
+      const threshold =
+        c.cosine !== null
+          ? c.coverage < this.cfg.minLexicalCoverage
+            ? Math.max(this.cfg.minSimilarity, 0.75)
+            : this.cfg.minSimilarity
+          : this.cfg.minLexicalCoverage;
 
       let drop: RetrievedChunk['drop_reason'] = null;
       if (this.trace.redactor.containsSecret(text)) drop = 'POLICY_FILTERED'; // safety first: never forward credentials to the model

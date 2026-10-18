@@ -104,14 +104,19 @@ export class ChatPipelineService {
     let webHits: WebSearchHit[] = [];
 
     if (wantsMessages || wantsWeb) {
-      const webQuery = rewritten[0] || input.question;
+      const baseWebQuery = rewritten[0] || input.question;
       const messageQueries = expandMemberQueries(input.question, rewritten, members);
-      const [messages, web] = await Promise.all([
-        wantsMessages ? this.retrieve(collector, input, messageQueries, now) : Promise.resolve(null),
-        wantsWeb ? this.searchWeb(collector, webQuery) : Promise.resolve(null),
-      ]);
-      retrievalPack = messages;
-      webHits = web?.results ?? [];
+      if (wantsMessages) {
+        retrievalPack = await this.retrieve(collector, input, messageQueries, now);
+      }
+      if (wantsWeb) {
+        const webQuery =
+          source === 'hybrid'
+            ? buildHybridWebQuery(baseWebQuery, retrievalPack)
+            : baseWebQuery;
+        const web = await this.searchWeb(collector, webQuery);
+        webHits = web.results;
+      }
 
       const messageHits = retrievalPack?.log.retrieved_chunks.filter((c) => c.drop_reason === null).length ?? 0;
       const hasEvidence =
@@ -343,4 +348,20 @@ function countDrops(chunks: { drop_reason: string | null }[]): Record<string, nu
 function maxSimilarity(chunks: { similarity_score: number }[]): number | null {
   if (!chunks.length) return null;
   return chunks.reduce((m, c) => Math.max(m, c.similarity_score), 0);
+}
+
+/**
+ * In hybrid mode, enriches the web search query with the top retrieved group message so
+ * chat-specific referents (e.g. "the restaurant Priya suggested" -> "Truffles Indiranagar")
+ * are resolved before querying Tavily.
+ */
+function buildHybridWebQuery(baseQuery: string, retrievalPack: RetrievalPack | null): string {
+  if (!retrievalPack) return baseQuery;
+  const topKept = retrievalPack.log.retrieved_chunks.find((c) => c.drop_reason === null);
+  if (!topKept) return baseQuery;
+  const topText = (retrievalPack.texts.get(topKept.chunk_id) ?? topKept.content_preview ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!topText) return baseQuery;
+  return `${baseQuery} (${topText.slice(0, 200)})`.slice(0, 380);
 }

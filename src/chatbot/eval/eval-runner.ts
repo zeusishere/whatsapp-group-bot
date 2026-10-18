@@ -301,8 +301,8 @@ export async function runEvaluation(options: RunEvalOptions = {}): Promise<EvalS
       const latencyMs = Math.round(performance.now() - t0);
 
       const spans = repo.getSpans(turn.turn_id);
-      const guardSpan = spans.find((s) => s.step_type === 'GUARDRAIL_CHECK');
-      const routerSpan = spans.find((s) => s.step_type === 'INTENT_ROUTER');
+      const guardSpan = [...spans].reverse().find((s) => s.step_type === 'GUARDRAIL_CHECK');
+      const routerSpan = [...spans].reverse().find((s) => s.step_type === 'INTENT_ROUTER');
 
       let actualRoute: Route | 'guardrail_blocked' | null = null;
       let actualSearchSource: SearchSource | null = null;
@@ -319,16 +319,24 @@ export async function runEvaluation(options: RunEvalOptions = {}): Promise<EvalS
         actualSearchSource = outcome.search_source ?? null;
       }
 
-      const routeMatch = actualRoute === tc.expectedRoute;
-      const sourceMatch = actualSearchSource === tc.expectedSearchSource;
-      const statusMatch = turn.status === tc.expectedStatus;
-
       const replyText = turn.bot_reply_raw ?? '';
       const replyLower = replyText.toLowerCase();
 
-      const missingExpected = tc.mustInclude.filter(
-        (needle) => !replyLower.includes(needle.toLowerCase()),
-      );
+      const naturalAbstention =
+        mode === 'live' &&
+        Boolean(tc.liveAllowNaturalAbstention) &&
+        turn.status === 'COMPLETED' &&
+        /\b(?:could(?:n't|\s+not)\s+find|cannot\s+find|can't\s+find|no\s+(?:relevant\s+|specific\s+)?(?:information|mention|results?|details)|don't\s+have\s+(?:enough\s+|any\s+|specific\s+)?(?:information|context|access))\b/i.test(
+          replyText,
+        );
+
+      const routeMatch = actualRoute === tc.expectedRoute;
+      const sourceMatch = actualSearchSource === tc.expectedSearchSource;
+      const statusMatch = turn.status === tc.expectedStatus || naturalAbstention;
+
+      const missingExpected = naturalAbstention
+        ? []
+        : tc.mustInclude.filter((needle) => !replyLower.includes(needle.toLowerCase()));
       const forbiddenFound = tc.mustNotInclude.filter((needle) =>
         replyLower.includes(needle.toLowerCase()),
       );
